@@ -83,6 +83,20 @@ def update_project(project_id: str, payload: Any = Body(...)) -> dict[str, Any] 
     return patch_record(get_database(), "projects", project_id, payload)
 
 
+@router.delete("/projects_update/{update_id}")
+def delete_project_update(update_id: str) -> dict[str, Any]:
+    """
+    Delete a project update by ID.
+    
+    Args:
+        update_id: The ID of the project update to delete
+
+    Returns:
+        A deletion result object
+    """
+    return delete_record(get_database(), "project_updates", update_id)
+
+
 @router.get("/{table}")
 def read_table(request: Request, table: str) -> list[dict[str, Any]]:
     return list_records(get_database(), table, dict(request.query_params))
