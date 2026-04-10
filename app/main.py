@@ -40,4 +40,5 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 def run() -> None:
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=settings.api_port, reload=True)
+    settings = load_settings()
+    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.api_port, reload=True)
