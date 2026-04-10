@@ -68,6 +68,21 @@ def download_file(file_path: str, download: str | None = None) -> FileResponse:
     return FileResponse(path=str(resolved), filename=download or Path(file_path).name)
 
 
+@router.patch("/projects/{project_id}")
+def update_project(project_id: str, payload: Any = Body(...)) -> dict[str, Any] | None:
+    """
+    Update a project by ID.
+    
+    Args:
+        project_id: The ID of the project to update
+        payload: The project data to update
+        
+    Returns:
+        The updated project record
+    """
+    return patch_record(get_database(), "projects", project_id, payload)
+
+
 @router.get("/{table}")
 def read_table(request: Request, table: str) -> list[dict[str, Any]]:
     return list_records(get_database(), table, dict(request.query_params))
