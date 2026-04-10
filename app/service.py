@@ -462,12 +462,14 @@ def get_dashboard_counters(database: Database) -> dict[str, int]:
     on_track_filter = {"status": {"$regex": "^On Track$", "$options": "i"}}
     at_risk_filter = {"status": {"$regex": "^At Risk$", "$options": "i"}}
     blocked_filter = {"status": {"$regex": "^Blocked$", "$options": "i"}}
+    completed_filter = {"status": {"$regex": "^Completed$", "$options": "i"}}
 
     return {
         "active_projects": projects.count_documents(active_filter),
         "on_track_projects": projects.count_documents(on_track_filter),
         "at_risk_projects": projects.count_documents(at_risk_filter),
         "blocked_projects": projects.count_documents(blocked_filter),
+        "completed_projects": projects.count_documents(completed_filter),
     }
 
 
