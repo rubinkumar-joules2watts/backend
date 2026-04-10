@@ -34,6 +34,16 @@ def dashboard_counters() -> dict[str, int]:
     return get_dashboard_counters(get_database())
 
 
+@router.get("/projects/first")
+def get_first_project() -> dict[str, Any] | None:
+    """
+    Get the first project (by creation date, oldest first).
+    Returns None if no projects exist.
+    """
+    projects = list_records(get_database(), "projects", {"orderBy": "created_at", "ascending": "true", "limit": "1"})
+    return projects[0] if projects else None
+
+
 @router.get("/projects/{project_id}/milestone-health")
 def get_milestone_health_endpoint(project_id: str) -> dict[str, Any]:
     """

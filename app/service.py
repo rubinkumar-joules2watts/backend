@@ -215,7 +215,20 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
             all_dates.append(invoice_eta)
 
     if not all_dates:
-        raise HTTPException(status_code=400, detail="No valid dates found in milestones")
+        # Return empty response when no valid dates found in milestones
+        return {
+            "project_id": project_id,
+            "project_name": project.get("name", ""),
+            "practice": [],
+            "signoff": [],
+            "invoice": [],
+            "weeks_range": {
+                "start_week": "",
+                "end_week": "",
+                "total_weeks": 0
+            },
+            "all_weeks": {}
+        }
 
     start_date = min(all_dates)
     end_date = max(all_dates)
@@ -465,6 +478,7 @@ def get_dashboard_counters(database: Database) -> dict[str, int]:
     completed_filter = {"status": {"$regex": "^Completed$", "$options": "i"}}
 
     return {
+        "total_projects": projects.count_documents({}),
         "active_projects": projects.count_documents(active_filter),
         "on_track_projects": projects.count_documents(on_track_filter),
         "at_risk_projects": projects.count_documents(at_risk_filter),
