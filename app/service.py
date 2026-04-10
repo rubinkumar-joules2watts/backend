@@ -249,7 +249,7 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         # === PRACTICE MILESTONE ===
         actual_start = parse_date(milestone.get("actual_start"))
         actual_end = parse_date(milestone.get("actual_end_eta"))
-        milestone_status = milestone.get("status", "").strip()
+        milestone_status = (milestone.get("status") or "").strip()
 
         practice_weeks = []
         practice_color = "gray"
@@ -351,7 +351,7 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         })
 
         # === SIGNOFF MILESTONE ===
-        signoff_status_raw = milestone.get("client_signoff_status", "").strip().lower()
+        signoff_status_raw = (milestone.get("client_signoff_status") or "").strip().lower()
         signoff_weeks = []
 
         # Determine which date to use based on status
@@ -393,7 +393,7 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         })
 
         # === INVOICE MILESTONE ===
-        invoice_status_raw = milestone.get("invoice_status", "").strip().lower()
+        invoice_status_raw = (milestone.get("invoice_status") or "").strip().lower()
         invoice_weeks = []
 
         # Determine which date to use based on status
