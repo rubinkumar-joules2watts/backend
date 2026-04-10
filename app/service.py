@@ -173,8 +173,8 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     """
     Get milestone health tracker data for a project.
     - Practice: range from actual_start to actual_end_eta with colors based on status field
-    - Signoff: point at actual_end_eta week with client_signoff_status (Done=green, Pending=orange)
-    - Invoice: point at actual_end_eta week with invoice_status (Done=green, Pending=orange)
+    - Signoff: point at actual_end_eta week (Pending) or signedoff_date week (Done)
+    - Invoice: point at actual_end_eta week (Pending) or invoice_raised_date week (Done)
     """
     # Fetch project
     project = database["projects"].find_one({"id": str(project_id)})
@@ -192,11 +192,27 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         # Practice dates
         actual_start = parse_date(milestone.get("actual_start"))
         actual_end = parse_date(milestone.get("actual_end_eta"))
+        
+        # Signoff dates
+        signoff_date = parse_date(milestone.get("signedoff_date"))
+        signoff_eta = parse_date(milestone.get("actual_end_eta"))
+        
+        # Invoice dates
+        invoice_date = parse_date(milestone.get("invoice_raised_date"))
+        invoice_eta = parse_date(milestone.get("actual_end_eta"))
 
         if actual_start:
             all_dates.append(actual_start)
         if actual_end:
             all_dates.append(actual_end)
+        if signoff_date:
+            all_dates.append(signoff_date)
+        if signoff_eta:
+            all_dates.append(signoff_eta)
+        if invoice_date:
+            all_dates.append(invoice_date)
+        if invoice_eta:
+            all_dates.append(invoice_eta)
 
     if not all_dates:
         raise HTTPException(status_code=400, detail="No valid dates found in milestones")
@@ -213,7 +229,12 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     current = start_date
     week_num = 0
     while current <= end_date:
-        week_label = current.strftime("%b %d, %Y").lstrip("0").replace(" 0", " ")
+        week_end = current + timedelta(days=6)  # Sunday of the week
+        # Format: "Feb 2-8, 2025" or "Feb 2-Mar 1, 2025" if crosses month
+        if current.month == week_end.month:
+            week_label = f"{current.strftime('%b %d')}-{week_end.strftime('%d, %Y')}".lstrip("0").replace(" 0", " ")
+        else:
+            week_label = f"{current.strftime('%b %d')}-{week_end.strftime('%b %d, %Y')}".lstrip("0").replace(" 0", " ")
         weeks_data[week_num] = {"label": week_label, "start": current.isoformat()}
         current += timedelta(days=7)
         week_num += 1
@@ -251,35 +272,72 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
 
             practice_color = final_color
 
-            # Calculate week number of actual_end
-            end_week_num = (actual_end.date() - start_date.date()).days // 7
+            # Find the Monday of the week containing actual_start
+            week_start_of_start = actual_start - timedelta(days=actual_start.weekday())
 
-            current = actual_start
-            while current.date() <= actual_end.date():
-                week_num, week_label = get_week_number_and_label(current, start_date)
+            # If actual_start is on Fri/Sat/Sun (last 3 days of week), skip partial week
+            # and start from the next Monday for cleaner alignment
+            if actual_start.weekday() >= 4:  # Friday=4, Saturday=5, Sunday=6
+                week_start_of_start = week_start_of_start + timedelta(days=7)
 
-                # Check if this is the final week (same week as actual_end_eta)
-                is_final_week = week_num == end_week_num
+            milestone_start_week_num = (week_start_of_start.date() - start_date.date()).days // 7
 
-                if is_final_week:
-                    # Final week: use milestone status
-                    week_status = final_status
-                    week_color = final_color
-                else:
-                    # Earlier weeks: always "On Track" (Green)
-                    week_status = "On Track"
-                    week_color = "green"
+            # Find the Monday of the week containing actual_end
+            # This is the last week where the milestone appears
+            week_start_of_end = actual_end - timedelta(days=actual_end.weekday())
+            end_week_num = (week_start_of_end.date() - start_date.date()).days // 7
 
-                practice_weeks.append({
-                    "week_number": week_num,
-                    "week_label": week_label,
-                    "status": week_status,
-                    "color": week_color,
-                    "date": current.isoformat()
-                })
-                current += timedelta(days=7)
+            # If milestone_start > end (can happen with very short milestones), include at least the end week
+            if milestone_start_week_num > end_week_num:
+                milestone_start_week_num = end_week_num
+
+            # Include all weeks where the milestone is running (from start to end)
+            for week_num_iter in range(milestone_start_week_num, end_week_num + 1):
+                if week_num_iter in weeks_data:
+                    week_label = weeks_data[week_num_iter]["label"]
+
+                    # Check if this is the final week
+                    is_final_week = week_num_iter == end_week_num
+                    is_first_week = week_num_iter == milestone_start_week_num
+
+                    if is_final_week:
+                        # Final week: use milestone status
+                        week_status = final_status
+                        week_color = final_color
+                    else:
+                        # Earlier weeks: always "On Track" (Green)
+                        week_status = "On Track"
+                        week_color = "green"
+
+                    # Determine the date for this week
+                    # - First AND last week: use actual_end (completion date)
+                    # - First week only: use actual_start
+                    # - Last week only: use actual_end
+                    # - Middle weeks: use week start
+                    if is_first_week and is_final_week:
+                        # Single week milestone: show the end date
+                        week_date = actual_end.isoformat()
+                    elif is_first_week:
+                        # Multi-week, first week: show start date
+                        week_date = actual_start.isoformat()
+                    elif is_final_week:
+                        # Multi-week, last week: show end date
+                        week_date = actual_end.isoformat()
+                    else:
+                        # Middle weeks: show week start
+                        week_date = weeks_data[week_num_iter]["start"]
+
+                    practice_weeks.append({
+                        "week_number": week_num_iter,
+                        "week_label": week_label,
+                        "milestone_code": milestone_code,
+                        "status": week_status,
+                        "color": week_color,
+                        "date": week_date
+                    })
 
         milestone_types_data["practice"].append({
+            "id": milestone.get("id"),
             "milestone_code": milestone_code,
             "description": description,
             "milestone_type": "practice",
@@ -293,74 +351,84 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         })
 
         # === SIGNOFF MILESTONE ===
-        actual_end_eta = parse_date(milestone.get("actual_end_eta"))
-        signoff_weeks = []
         signoff_status_raw = milestone.get("client_signoff_status", "").strip().lower()
+        signoff_weeks = []
 
-        if actual_end_eta:
-            week_num, week_label = get_week_number_and_label(actual_end_eta, start_date)
+        # Determine which date to use based on status
+        if signoff_status_raw == "done":
+            # Use the actual completion date if available, otherwise actual_end_eta
+            signoff_date = parse_date(milestone.get("signedoff_date"))
+            signoff_display_date = signoff_date or parse_date(milestone.get("actual_end_eta"))
+            signoff_status = "Done"
+            signoff_color = "green"
+        else:
+            # Use the ETA date for pending status
+            signoff_display_date = parse_date(milestone.get("actual_end_eta"))
+            signoff_status = "Pending"
+            signoff_color = "orange"
 
-            # Map client_signoff_status to status and color
-            if signoff_status_raw == "done":
-                signoff_status = "Done"
-                signoff_color = "green"
-            elif signoff_status_raw == "pending":
-                signoff_status = "Pending"
-                signoff_color = "orange"
-            else:
-                signoff_status = signoff_status_raw.capitalize() if signoff_status_raw else "Pending"
-                signoff_color = "orange" if signoff_status_raw == "pending" else "green"
+        if signoff_display_date:
+            week_num, _ = get_week_number_and_label(signoff_display_date, start_date)
+            # Use the week_label from all_weeks for consistency
+            week_label = weeks_data[week_num]["label"] if week_num in weeks_data else ""
 
             signoff_weeks.append({
                 "week_number": week_num,
                 "week_label": week_label,
+                "milestone_code": milestone_code,
                 "status": signoff_status,
                 "color": signoff_color,
-                "date": actual_end_eta.isoformat()
+                "date": signoff_display_date.isoformat()
             })
 
         milestone_types_data["signoff"].append({
+            "id": milestone.get("id"),
             "milestone_code": milestone_code,
             "description": description,
             "milestone_type": "signoff",
-            "date": actual_end_eta.isoformat() if actual_end_eta else None,
+            "date": signoff_display_date.isoformat() if signoff_display_date else None,
             "weeks": signoff_weeks,
             "signoff_status": milestone.get("client_signoff_status", ""),
             "status": milestone.get("status", "")
         })
 
         # === INVOICE MILESTONE ===
-        actual_end_eta = parse_date(milestone.get("actual_end_eta"))
-        invoice_weeks = []
         invoice_status_raw = milestone.get("invoice_status", "").strip().lower()
+        invoice_weeks = []
 
-        if actual_end_eta:
-            week_num, week_label = get_week_number_and_label(actual_end_eta, start_date)
+        # Determine which date to use based on status
+        if invoice_status_raw == "done":
+            # Use the actual completion date if available, otherwise actual_end_eta
+            invoice_date = parse_date(milestone.get("invoice_raised_date"))
+            invoice_display_date = invoice_date or parse_date(milestone.get("actual_end_eta"))
+            invoice_status = "Done"
+            invoice_color = "green"
+        else:
+            # Use the ETA date for pending status
+            invoice_display_date = parse_date(milestone.get("actual_end_eta"))
+            invoice_status = "Pending"
+            invoice_color = "orange"
 
-            # Map invoice_status to status and color
-            if invoice_status_raw == "done":
-                invoice_status = "Done"
-                invoice_color = "green"
-            elif invoice_status_raw == "pending":
-                invoice_status = "Pending"
-                invoice_color = "orange"
-            else:
-                invoice_status = invoice_status_raw.capitalize() if invoice_status_raw else "Pending"
-                invoice_color = "orange" if invoice_status_raw == "pending" else "green"
+        if invoice_display_date:
+            week_num, _ = get_week_number_and_label(invoice_display_date, start_date)
+            # Use the week_label from all_weeks for consistency
+            week_label = weeks_data[week_num]["label"] if week_num in weeks_data else ""
 
             invoice_weeks.append({
                 "week_number": week_num,
                 "week_label": week_label,
+                "milestone_code": milestone_code,
                 "status": invoice_status,
                 "color": invoice_color,
-                "date": actual_end_eta.isoformat()
+                "date": invoice_display_date.isoformat()
             })
 
         milestone_types_data["invoice"].append({
+            "id": milestone.get("id"),
             "milestone_code": milestone_code,
             "description": description,
             "milestone_type": "invoice",
-            "date": actual_end_eta.isoformat() if actual_end_eta else None,
+            "date": invoice_display_date.isoformat() if invoice_display_date else None,
             "weeks": invoice_weeks,
             "invoice_status": milestone.get("invoice_status", ""),
             "status": milestone.get("status", "")
