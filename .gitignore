@@ -139,3 +139,5 @@ Thumbs.db
 # Project specific
 uploads/
 *.log
+.vercel
+.env*.local

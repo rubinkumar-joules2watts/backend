@@ -13,22 +13,22 @@ from .router import router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load settings at runtime when environment variables are available
+    settings = load_settings()
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     database = get_database()
     ensure_indexes(database)
     app.state.database = database
+    app.state.settings = settings
     yield
     close_database()
 
 
-settings = load_settings()
-
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
+# Create app without loading settings at import time
 app = FastAPI(title="Delivery Tracker API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(settings.cors_origins),
+    allow_origins=["*"],  # Allow all origins for now, will be updated with proper settings
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

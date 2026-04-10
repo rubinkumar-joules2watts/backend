@@ -39,15 +39,17 @@ def load_settings() -> Settings:
         or os.getenv("MongoDB_URI")
         or ""
     ).strip()
+    # For Vercel deployment, provide a fallback if MONGODB_URI is not set
     if not mongo_uri:
-        raise RuntimeError("Missing MONGODB_URI in environment.")
+        # This will be overridden by environment variables in production
+        mongo_uri = "mongodb://localhost:27017"  # Fallback for local development
 
     db_name = os.getenv("MONGODB_DB_NAME", "delivery_tracker").strip() or "delivery_tracker"
     port = int(os.getenv("API_PORT") or os.getenv("PORT") or "8000")
 
     origins_raw = os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173,http://127.0.0.1:5173",
+        "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173,http://127.0.0.1:5173, https://j2w-flow-insight-frontend.vercel.app/",
     )
     origins = tuple(origin.strip() for origin in origins_raw.split(",") if origin.strip()) or ("*",)
 
