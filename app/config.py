@@ -20,6 +20,7 @@ COLLECTIONS = (
     "audit_log",
     "project_updates",
     "project_documents",
+    "team_members_engagement",
 )
 
 

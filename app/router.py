@@ -14,10 +14,13 @@ from .service import (
     get_dashboard_counters,
     get_milestone_health,
     get_record,
+    get_team_members_with_engagement,
     list_records,
     patch_record,
     replace_record,
     save_upload,
+    update_milestone_health,
+    update_week_status,
 )
 
 
@@ -32,6 +35,25 @@ def health() -> dict[str, bool]:
 @router.get("/dashboard/counters")
 def dashboard_counters() -> dict[str, int]:
     return get_dashboard_counters(get_database())
+
+
+@router.get("/team_members")
+def get_team_members_endpoint() -> list[dict[str, Any]]:
+    """
+    Get all team members with their engagement metrics.
+
+    Aggregates engagement data from team_members_engagement collection and includes:
+    - engagement_pct: Average engagement percentage across all projects
+    - total_engagement_hours: Sum of hours across all projects
+    - total_tasks_completed: Sum of completed tasks across all projects
+    - total_tasks_pending: Sum of pending tasks across all projects
+    - projects_assigned: Number of projects the member is assigned to
+    - engagements: List of all engagement records for the member
+
+    Returns:
+        List of team members with aggregated engagement data
+    """
+    return get_team_members_with_engagement(get_database())
 
 
 @router.get("/projects/first")
@@ -52,6 +74,80 @@ def get_milestone_health_endpoint(project_id: str) -> dict[str, Any]:
     Returns status (On Track/At Risk/Blocked/Completed) and colors for each milestone across weeks.
     """
     return get_milestone_health(get_database(), project_id)
+
+
+@router.patch("/milestones/{milestone_id}/health/{milestone_type}")
+def update_milestone_health_endpoint(
+    milestone_id: str,
+    milestone_type: str,
+    payload: Any = Body(...),
+) -> dict[str, Any] | None:
+    """
+    Update a specific milestone health type (practice, signoff, or invoice).
+
+    Args:
+        milestone_id: The ID of the milestone
+        milestone_type: The type of milestone - "practice", "signoff", or "invoice"
+        payload: Update payload
+
+    Payload Examples:
+        # For practice status
+        {
+            "status": "At Risk"  // "On Track", "At Risk", "Blocked", "Completed"
+        }
+
+        # For signoff
+        {
+            "status": "Done",  // "Done" or "Pending"
+            "date": "2026-02-07"  // optional, only for "Done"
+        }
+
+        # For invoice
+        {
+            "status": "Done",  // "Done" or "Pending"
+            "date": "2026-02-07"  // optional, only for "Done"
+        }
+
+    Returns:
+        Updated milestone with regenerated week data
+    """
+    status = payload.get("status")
+    date = payload.get("date")
+
+    if not status:
+        raise HTTPException(status_code=400, detail="status field is required")
+
+    return update_milestone_health(get_database(), milestone_id, milestone_type, status, date)
+
+
+@router.patch("/milestones/{milestone_id}/health/{milestone_type}/week/{week_number}")
+def update_week_status_endpoint(
+    milestone_id: str,
+    milestone_type: str,
+    week_number: int,
+    payload: Any = Body(...),
+) -> dict[str, Any] | None:
+    """
+    Update status for a specific week in a milestone.
+
+    Args:
+        milestone_id: The ID of the milestone
+        milestone_type: The type of milestone - "practice", "signoff", or "invoice"
+        week_number: The week number to update
+        payload: Week update payload
+
+    Payload Example:
+        {
+            "week_status": "At Risk",           // New status from user
+            "week_label": "Feb 16-22, 2026",
+            "color": "orange",
+            "date": "2026-02-20"
+        }
+
+    Returns:
+        Updated milestone with the week status changed
+    """
+    return update_week_status(get_database(), milestone_id, milestone_type, week_number, payload)
 
 
 @router.post("/upload")
@@ -97,7 +193,7 @@ def update_project(project_id: str, payload: Any = Body(...)) -> dict[str, Any] 
 def delete_project_update(update_id: str) -> dict[str, Any]:
     """
     Delete a project update by ID.
-    
+
     Args:
         update_id: The ID of the project update to delete
 
@@ -105,6 +201,39 @@ def delete_project_update(update_id: str) -> dict[str, Any]:
         A deletion result object
     """
     return delete_record(get_database(), "project_updates", update_id)
+
+
+@router.get("/team_members_engagement/member/{member_id}/project/{project_id}")
+def get_team_member_project_engagement(member_id: str, project_id: str) -> list[dict[str, Any]]:
+    """
+    Get engagement record for a specific team member on a specific project.
+
+    Args:
+        member_id: The ID of the team member
+        project_id: The ID of the project
+
+    Returns:
+        Engagement record(s) for that member on that project
+    """
+    return list_records(
+        get_database(),
+        "team_members_engagement",
+        {"team_member_id": member_id, "project_id": project_id}
+    )
+
+
+@router.get("/team_members_engagement/member/{member_id}")
+def get_team_member_engagements(member_id: str) -> list[dict[str, Any]]:
+    """
+    Get all engagement records for a specific team member across all projects.
+
+    Args:
+        member_id: The ID of the team member
+
+    Returns:
+        List of engagement records for that team member
+    """
+    return list_records(get_database(), "team_members_engagement", {"team_member_id": member_id})
 
 
 @router.get("/{table}")

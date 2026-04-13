@@ -51,6 +51,12 @@ def normalize_on_insert(table: str, document: dict[str, Any]) -> dict[str, Any]:
         next_document["created_at"] = next_document.get("created_at") or now
         next_document["changed_by"] = next_document.get("changed_by") or "system"
 
+    # Initialize week data arrays for milestones (will be populated after insert)
+    if table == "milestones":
+        next_document["practice_weeks"] = next_document.get("practice_weeks") or []
+        next_document["signoff_weeks"] = next_document.get("signoff_weeks") or []
+        next_document["invoice_weeks"] = next_document.get("invoice_weeks") or []
+
     return next_document
 
 
@@ -169,12 +175,270 @@ def get_status_and_color(status_value: str | None, is_pending: bool = False) -> 
     return "On Track", "green"
 
 
+def generate_practice_weeks(milestone: dict[str, Any], start_date: datetime, weeks_data: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Generate practice week data based on actual_start, actual_end_eta, and status.
+    Returns list of week markers with status and color for each week.
+
+    Status Logic:
+    - If status="Completed" AND actual_end_eta date has passed → Show as Completed (blue)
+    - Else use the milestone status field as-is
+    """
+    practice_weeks = []
+
+    actual_start = parse_date(milestone.get("actual_start"))
+    actual_end = parse_date(milestone.get("actual_end_eta"))
+    milestone_status = (milestone.get("status") or "").strip()
+
+    if not actual_start or not actual_end:
+        return practice_weeks
+
+    # ============ DETERMINE FINAL WEEK STATUS AND COLOR ============
+    # This is where we check the "Completed" status based on the milestone status field
+    # The final week gets the current milestone status, regardless of the actual_end_eta date
+
+    status_lower = milestone_status.lower() if milestone_status else ""
+
+    # Map status to color and display status
+    # - If status="Completed" → Show as blue/Completed
+    # - If status="At Risk" → Show as orange/At Risk
+    # - If status="Blocked" → Show as red/Blocked
+    # - Otherwise → Show as green/On Track
+
+    if status_lower == "completed":
+        # ✅ MILESTONE IS MARKED AS COMPLETED
+        final_color = "blue"
+        final_status = "Completed"
+    elif status_lower == "at risk":
+        final_color = "orange"
+        final_status = "At Risk"
+    elif status_lower == "blocked":
+        final_color = "red"
+        final_status = "Blocked"
+    else:  # "on track" or default
+        final_color = "green"
+        final_status = "On Track"
+
+    # Find the Monday of the week containing actual_start
+    week_start_of_start = actual_start - timedelta(days=actual_start.weekday())
+
+    # If actual_start is on Fri/Sat/Sun (last 3 days of week), skip partial week
+    if actual_start.weekday() >= 4:  # Friday=4, Saturday=5, Sunday=6
+        week_start_of_start = week_start_of_start + timedelta(days=7)
+
+    milestone_start_week_num = (week_start_of_start.date() - start_date.date()).days // 7
+
+    # Find the Monday of the week containing actual_end
+    week_start_of_end = actual_end - timedelta(days=actual_end.weekday())
+    end_week_num = (week_start_of_end.date() - start_date.date()).days // 7
+
+    # If milestone_start > end, include at least the end week
+    if milestone_start_week_num > end_week_num:
+        milestone_start_week_num = end_week_num
+
+    # Include all weeks where the milestone is running
+    for week_num_iter in range(milestone_start_week_num, end_week_num + 1):
+        if week_num_iter in weeks_data:
+            week_label = weeks_data[week_num_iter]["label"]
+
+            is_final_week = week_num_iter == end_week_num
+            is_first_week = week_num_iter == milestone_start_week_num
+
+            if is_final_week:
+                week_status = final_status
+                week_color = final_color
+            else:
+                week_status = "On Track"
+                week_color = "green"
+
+            # Determine the date for this week
+            if is_first_week and is_final_week:
+                week_date = actual_end.isoformat()
+            elif is_first_week:
+                week_date = actual_start.isoformat()
+            elif is_final_week:
+                week_date = actual_end.isoformat()
+            else:
+                week_date = weeks_data[week_num_iter]["start"]
+
+            practice_weeks.append({
+                "week_number": week_num_iter,
+                "week_label": week_label,
+                "status": week_status,
+                "color": week_color,
+                "date": week_date
+            })
+
+    return practice_weeks
+
+
+def generate_signoff_weeks(milestone: dict[str, Any], start_date: datetime, weeks_data: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Generate signoff week data based on client_signoff_status.
+    Returns list with single week marker showing signoff status.
+
+    Logic:
+    - If status="Done" → Use signedoff_date or actual_end_eta
+    - If status="Pending" → Use actual_end_eta
+    """
+    signoff_weeks = []
+
+    signoff_status_raw = (milestone.get("client_signoff_status") or "").strip().lower()
+    actual_end_eta = parse_date(milestone.get("actual_end_eta"))
+
+    # Determine which date to use based on status
+    if signoff_status_raw == "done":
+        signoff_date = parse_date(milestone.get("signedoff_date"))
+        signoff_display_date = signoff_date or actual_end_eta
+        signoff_status = "Done"
+        signoff_color = "green"
+    else:
+        signoff_display_date = actual_end_eta
+        signoff_status = "Pending"
+        signoff_color = "orange"
+
+    if signoff_display_date:
+        week_num, _ = get_week_number_and_label(signoff_display_date, start_date)
+        week_label = weeks_data[week_num]["label"] if week_num in weeks_data else ""
+
+        signoff_weeks.append({
+            "week_number": week_num,
+            "week_label": week_label,
+            "status": signoff_status,
+            "color": signoff_color,
+            "date": signoff_display_date.isoformat()
+        })
+
+    return signoff_weeks
+
+
+def generate_invoice_weeks(milestone: dict[str, Any], start_date: datetime, weeks_data: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Generate invoice week data based on invoice_status.
+    Returns list with single week marker showing invoice status.
+
+    Logic:
+    - If status="Done" → Use invoice_raised_date or actual_end_eta
+    - If status="Pending" → Use actual_end_eta
+    """
+    invoice_weeks = []
+
+    invoice_status_raw = (milestone.get("invoice_status") or "").strip().lower()
+    actual_end_eta = parse_date(milestone.get("actual_end_eta"))
+
+    # Determine which date to use based on status
+    if invoice_status_raw == "done":
+        invoice_date = parse_date(milestone.get("invoice_raised_date"))
+        invoice_display_date = invoice_date or actual_end_eta
+        invoice_status = "Done"
+        invoice_color = "green"
+    else:
+        invoice_display_date = actual_end_eta
+        invoice_status = "Pending"
+        invoice_color = "orange"
+
+    if invoice_display_date:
+        week_num, _ = get_week_number_and_label(invoice_display_date, start_date)
+        week_label = weeks_data[week_num]["label"] if week_num in weeks_data else ""
+
+        invoice_weeks.append({
+            "week_number": week_num,
+            "week_label": week_label,
+            "status": invoice_status,
+            "color": invoice_color,
+            "date": invoice_display_date.isoformat()
+        })
+
+    return invoice_weeks
+
+
+def generate_all_milestone_weeks(database: Database, milestone: dict[str, Any]) -> dict[str, Any]:
+    """
+    Generate and store all week data (practice, signoff, invoice) for a milestone.
+    Called when a milestone is created or updated.
+    """
+    project_id = milestone.get("project_id")
+
+    # Get all milestones to calculate date range
+    all_milestones = list(database["milestones"].find({"project_id": str(project_id)}))
+
+    all_dates = []
+    for m in all_milestones:
+        actual_start = parse_date(m.get("actual_start"))
+        actual_end = parse_date(m.get("actual_end_eta"))
+        signoff_date = parse_date(m.get("signedoff_date"))
+        signoff_eta = parse_date(m.get("actual_end_eta"))
+        invoice_date = parse_date(m.get("invoice_raised_date"))
+        invoice_eta = parse_date(m.get("actual_end_eta"))
+
+        for date in [actual_start, actual_end, signoff_date, signoff_eta, invoice_date, invoice_eta]:
+            if date:
+                all_dates.append(date)
+
+    if not all_dates:
+        return {
+            "practice_weeks": [],
+            "signoff_weeks": [],
+            "invoice_weeks": []
+        }
+
+    start_date = min(all_dates)
+    end_date = max(all_dates)
+
+    # Extend range to include full weeks
+    start_date = start_date - timedelta(days=start_date.weekday())
+    end_date = end_date + timedelta(days=(6 - end_date.weekday()))
+
+    # Generate all weeks
+    weeks_data: dict[int, dict[str, Any]] = {}
+    current = start_date
+    week_num = 0
+    while current <= end_date:
+        week_end = current + timedelta(days=6)
+        if current.month == week_end.month:
+            week_label = f"{current.strftime('%b %d')}-{week_end.strftime('%d, %Y')}".lstrip("0").replace(" 0", " ")
+        else:
+            week_label = f"{current.strftime('%b %d')}-{week_end.strftime('%b %d, %Y')}".lstrip("0").replace(" 0", " ")
+        weeks_data[week_num] = {"label": week_label, "start": current.isoformat()}
+        current += timedelta(days=7)
+        week_num += 1
+
+    # Generate week data for each type
+    practice_weeks = generate_practice_weeks(milestone, start_date, weeks_data)
+    signoff_weeks = generate_signoff_weeks(milestone, start_date, weeks_data)
+    invoice_weeks = generate_invoice_weeks(milestone, start_date, weeks_data)
+
+    return {
+        "practice_weeks": practice_weeks,
+        "signoff_weeks": signoff_weeks,
+        "invoice_weeks": invoice_weeks
+    }
+
+
+def regenerate_project_milestone_weeks(database: Database, project_id: str) -> None:
+    """
+    Regenerate week data for all milestones in a project.
+    Called after creating or updating any milestone.
+    """
+    milestones = list(database["milestones"].find({"project_id": str(project_id)}))
+
+    for milestone in milestones:
+        week_data = generate_all_milestone_weeks(database, milestone)
+        database["milestones"].update_one(
+            {"id": milestone.get("id")},
+            {"$set": week_data}
+        )
+
+
 def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     """
     Get milestone health tracker data for a project.
-    - Practice: range from actual_start to actual_end_eta with colors based on status field
-    - Signoff: point at actual_end_eta week (Pending) or signedoff_date week (Done)
-    - Invoice: point at actual_end_eta week (Pending) or invoice_raised_date week (Done)
+    Uses pre-calculated week data stored in milestones collection.
+
+    Filtering Logic:
+    - Practice weeks: Show if actual_end_eta exists
+    - Signoff: Show if actual_end_eta exists (calculate status based on client_signoff_status)
+    - Invoice: Show if actual_end_eta exists (calculate status based on invoice_status)
     """
     # Fetch project
     project = database["projects"].find_one({"id": str(project_id)})
@@ -186,42 +450,130 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     if not milestones:
         raise HTTPException(status_code=404, detail="No milestones found for this project")
 
-    # Parse all dates to find date range
-    all_dates = []
+    # Collect all week data from milestones
+    practice_data = []
+    signoff_data = []
+    invoice_data = []
+    all_weeks_collected: dict[int, dict[str, Any]] = {}
+
     for milestone in milestones:
-        # Practice dates
-        actual_start = parse_date(milestone.get("actual_start"))
-        actual_end = parse_date(milestone.get("actual_end_eta"))
-        
-        # Signoff dates
-        signoff_date = parse_date(milestone.get("signedoff_date"))
-        signoff_eta = parse_date(milestone.get("actual_end_eta"))
-        
-        # Invoice dates
-        invoice_date = parse_date(milestone.get("invoice_raised_date"))
-        invoice_eta = parse_date(milestone.get("actual_end_eta"))
+        milestone_code = milestone.get("milestone_code", "")
+        description = milestone.get("description", "")
+        milestone_id = milestone.get("id")
+        actual_end_eta = milestone.get("actual_end_eta")
 
-        if actual_start:
-            all_dates.append(actual_start)
-        if actual_end:
-            all_dates.append(actual_end)
-        if signoff_date:
-            all_dates.append(signoff_date)
-        if signoff_eta:
-            all_dates.append(signoff_eta)
-        if invoice_date:
-            all_dates.append(invoice_date)
-        if invoice_eta:
-            all_dates.append(invoice_eta)
+        # Get practice weeks (from stored data)
+        # Show practice weeks only if actual_end_eta exists
+        practice_weeks = milestone.get("practice_weeks", [])
+        if practice_weeks and actual_end_eta:
+            # Determine overall color based on final week status
+            final_week = practice_weeks[-1]
+            practice_color = final_week.get("color", "gray")
 
-    if not all_dates:
-        # Return empty response when no valid dates found in milestones
+            # Collect weeks for all_weeks map
+            for week in practice_weeks:
+                week_num = week.get("week_number", 0)
+                if week_num not in all_weeks_collected:
+                    all_weeks_collected[week_num] = {
+                        "label": week.get("week_label", ""),
+                        "start": week.get("date", "")
+                    }
+
+            actual_start = parse_date(milestone.get("actual_start"))
+            actual_end = parse_date(milestone.get("actual_end_eta"))
+
+            practice_data.append({
+                "id": milestone_id,
+                "milestone_code": milestone_code,
+                "description": description,
+                "milestone_type": "practice",
+                "start_date": actual_start.isoformat() if actual_start else None,
+                "end_date": actual_end.isoformat() if actual_end else None,
+                "weeks": practice_weeks,
+                "completion_pct": milestone.get("completion_pct", 0),
+                "status": milestone.get("status", ""),
+                "color": practice_color,
+                "days_variance": milestone.get("days_variance", 0)
+            })
+
+        # Get signoff data
+        # Show signoff if actual_end_eta exists, regardless of whether signoff_weeks exists
+        if actual_end_eta:
+            signoff_weeks = milestone.get("signoff_weeks", [])
+            
+            # Collect weeks for all_weeks map if they exist
+            for week in signoff_weeks:
+                week_num = week.get("week_number", 0)
+                if week_num not in all_weeks_collected:
+                    all_weeks_collected[week_num] = {
+                        "label": week.get("week_label", ""),
+                        "start": week.get("date", "")
+                    }
+
+            signoff_display_date = parse_date(milestone.get("signedoff_date")) or parse_date(milestone.get("actual_end_eta"))
+            
+            # Calculate signoff status based on client_signoff_status
+            client_signoff_status = milestone.get("client_signoff_status", "")
+            if client_signoff_status == "Done":
+                calculated_signoff_status = "Done"
+            elif client_signoff_status == "Partial":
+                calculated_signoff_status = "Partial"
+            else:
+                calculated_signoff_status = "Pending"
+
+            signoff_data.append({
+                "id": milestone_id,
+                "milestone_code": milestone_code,
+                "description": description,
+                "milestone_type": "signoff",
+                "date": signoff_display_date.isoformat() if signoff_display_date else None,
+                "signoff_status": client_signoff_status,
+                "status": calculated_signoff_status
+            })
+
+        # Get invoice data
+        # Show invoice if actual_end_eta exists, regardless of whether invoice_weeks exists
+        if actual_end_eta:
+            invoice_weeks = milestone.get("invoice_weeks", [])
+            
+            # Collect weeks for all_weeks map if they exist
+            for week in invoice_weeks:
+                week_num = week.get("week_number", 0)
+                if week_num not in all_weeks_collected:
+                    all_weeks_collected[week_num] = {
+                        "label": week.get("week_label", ""),
+                        "start": week.get("date", "")
+                    }
+
+            invoice_display_date = parse_date(milestone.get("invoice_raised_date")) or parse_date(milestone.get("actual_end_eta"))
+            
+            # Calculate invoice status based on invoice_status
+            invoice_status = milestone.get("invoice_status", "")
+            if invoice_status == "Done":
+                calculated_invoice_status = "Done"
+            elif invoice_status == "Partial":
+                calculated_invoice_status = "Partial"
+            else:
+                calculated_invoice_status = "Pending"
+
+            invoice_data.append({
+                "id": milestone_id,
+                "milestone_code": milestone_code,
+                "description": description,
+                "milestone_type": "invoice",
+                "date": invoice_display_date.isoformat() if invoice_display_date else None,
+                "invoice_status": invoice_status,
+                "status": calculated_invoice_status
+            })
+
+    # If no weeks were collected, return empty
+    if not all_weeks_collected:
         return {
             "project_id": project_id,
             "project_name": project.get("name", ""),
-            "practice": [],
-            "signoff": [],
-            "invoice": [],
+            "practice": practice_data,
+            "signoff": signoff_data,
+            "invoice": invoice_data,
             "weeks_range": {
                 "start_week": "",
                 "end_week": "",
@@ -230,235 +582,22 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
             "all_weeks": {}
         }
 
-    start_date = min(all_dates)
-    end_date = max(all_dates)
-
-    # Extend range to include full weeks
-    start_date = start_date - timedelta(days=start_date.weekday())  # Start from Monday
-    end_date = end_date + timedelta(days=(6 - end_date.weekday()))  # End on Sunday
-
-    # Generate all weeks
-    weeks_data: dict[int, dict[str, Any]] = {}
-    current = start_date
-    week_num = 0
-    while current <= end_date:
-        week_end = current + timedelta(days=6)  # Sunday of the week
-        # Format: "Feb 2-8, 2025" or "Feb 2-Mar 1, 2025" if crosses month
-        if current.month == week_end.month:
-            week_label = f"{current.strftime('%b %d')}-{week_end.strftime('%d, %Y')}".lstrip("0").replace(" 0", " ")
-        else:
-            week_label = f"{current.strftime('%b %d')}-{week_end.strftime('%b %d, %Y')}".lstrip("0").replace(" 0", " ")
-        weeks_data[week_num] = {"label": week_label, "start": current.isoformat()}
-        current += timedelta(days=7)
-        week_num += 1
-
-    # Process all milestones
-    milestone_types_data = {"practice": [], "signoff": [], "invoice": []}
-
-    for milestone in milestones:
-        milestone_code = milestone.get("milestone_code", "")
-        description = milestone.get("description", "")
-
-        # === PRACTICE MILESTONE ===
-        actual_start = parse_date(milestone.get("actual_start"))
-        actual_end = parse_date(milestone.get("actual_end_eta"))
-        milestone_status = (milestone.get("status") or "").strip()
-
-        practice_weeks = []
-        practice_color = "gray"
-
-        if actual_start and actual_end:
-            # Determine final week color based on milestone status
-            status_lower = milestone_status.lower() if milestone_status else ""
-            if status_lower == "completed":
-                final_color = "blue"
-                final_status = "Completed"
-            elif status_lower == "at risk":
-                final_color = "orange"
-                final_status = "At Risk"
-            elif status_lower == "blocked":
-                final_color = "red"
-                final_status = "Blocked"
-            else:  # "on track" or default
-                final_color = "green"
-                final_status = "On Track"
-
-            practice_color = final_color
-
-            # Find the Monday of the week containing actual_start
-            week_start_of_start = actual_start - timedelta(days=actual_start.weekday())
-
-            # If actual_start is on Fri/Sat/Sun (last 3 days of week), skip partial week
-            # and start from the next Monday for cleaner alignment
-            if actual_start.weekday() >= 4:  # Friday=4, Saturday=5, Sunday=6
-                week_start_of_start = week_start_of_start + timedelta(days=7)
-
-            milestone_start_week_num = (week_start_of_start.date() - start_date.date()).days // 7
-
-            # Find the Monday of the week containing actual_end
-            # This is the last week where the milestone appears
-            week_start_of_end = actual_end - timedelta(days=actual_end.weekday())
-            end_week_num = (week_start_of_end.date() - start_date.date()).days // 7
-
-            # If milestone_start > end (can happen with very short milestones), include at least the end week
-            if milestone_start_week_num > end_week_num:
-                milestone_start_week_num = end_week_num
-
-            # Include all weeks where the milestone is running (from start to end)
-            for week_num_iter in range(milestone_start_week_num, end_week_num + 1):
-                if week_num_iter in weeks_data:
-                    week_label = weeks_data[week_num_iter]["label"]
-
-                    # Check if this is the final week
-                    is_final_week = week_num_iter == end_week_num
-                    is_first_week = week_num_iter == milestone_start_week_num
-
-                    if is_final_week:
-                        # Final week: use milestone status
-                        week_status = final_status
-                        week_color = final_color
-                    else:
-                        # Earlier weeks: always "On Track" (Green)
-                        week_status = "On Track"
-                        week_color = "green"
-
-                    # Determine the date for this week
-                    # - First AND last week: use actual_end (completion date)
-                    # - First week only: use actual_start
-                    # - Last week only: use actual_end
-                    # - Middle weeks: use week start
-                    if is_first_week and is_final_week:
-                        # Single week milestone: show the end date
-                        week_date = actual_end.isoformat()
-                    elif is_first_week:
-                        # Multi-week, first week: show start date
-                        week_date = actual_start.isoformat()
-                    elif is_final_week:
-                        # Multi-week, last week: show end date
-                        week_date = actual_end.isoformat()
-                    else:
-                        # Middle weeks: show week start
-                        week_date = weeks_data[week_num_iter]["start"]
-
-                    practice_weeks.append({
-                        "week_number": week_num_iter,
-                        "week_label": week_label,
-                        "milestone_code": milestone_code,
-                        "status": week_status,
-                        "color": week_color,
-                        "date": week_date
-                    })
-
-        milestone_types_data["practice"].append({
-            "id": milestone.get("id"),
-            "milestone_code": milestone_code,
-            "description": description,
-            "milestone_type": "practice",
-            "start_date": actual_start.isoformat() if actual_start else None,
-            "end_date": actual_end.isoformat() if actual_end else None,
-            "weeks": practice_weeks,
-            "completion_pct": milestone.get("completion_pct", 0),
-            "status": milestone_status,
-            "color": practice_color,
-            "days_variance": milestone.get("days_variance", 0)
-        })
-
-        # === SIGNOFF MILESTONE ===
-        signoff_status_raw = (milestone.get("client_signoff_status") or "").strip().lower()
-        signoff_weeks = []
-
-        # Determine which date to use based on status
-        if signoff_status_raw == "done":
-            # Use the actual completion date if available, otherwise actual_end_eta
-            signoff_date = parse_date(milestone.get("signedoff_date"))
-            signoff_display_date = signoff_date or parse_date(milestone.get("actual_end_eta"))
-            signoff_status = "Done"
-            signoff_color = "green"
-        else:
-            # Use the ETA date for pending status
-            signoff_display_date = parse_date(milestone.get("actual_end_eta"))
-            signoff_status = "Pending"
-            signoff_color = "orange"
-
-        if signoff_display_date:
-            week_num, _ = get_week_number_and_label(signoff_display_date, start_date)
-            # Use the week_label from all_weeks for consistency
-            week_label = weeks_data[week_num]["label"] if week_num in weeks_data else ""
-
-            signoff_weeks.append({
-                "week_number": week_num,
-                "week_label": week_label,
-                "milestone_code": milestone_code,
-                "status": signoff_status,
-                "color": signoff_color,
-                "date": signoff_display_date.isoformat()
-            })
-
-        milestone_types_data["signoff"].append({
-            "id": milestone.get("id"),
-            "milestone_code": milestone_code,
-            "description": description,
-            "milestone_type": "signoff",
-            "date": signoff_display_date.isoformat() if signoff_display_date else None,
-            "weeks": signoff_weeks,
-            "signoff_status": milestone.get("client_signoff_status", ""),
-            "status": milestone.get("status", "")
-        })
-
-        # === INVOICE MILESTONE ===
-        invoice_status_raw = (milestone.get("invoice_status") or "").strip().lower()
-        invoice_weeks = []
-
-        # Determine which date to use based on status
-        if invoice_status_raw == "done":
-            # Use the actual completion date if available, otherwise actual_end_eta
-            invoice_date = parse_date(milestone.get("invoice_raised_date"))
-            invoice_display_date = invoice_date or parse_date(milestone.get("actual_end_eta"))
-            invoice_status = "Done"
-            invoice_color = "green"
-        else:
-            # Use the ETA date for pending status
-            invoice_display_date = parse_date(milestone.get("actual_end_eta"))
-            invoice_status = "Pending"
-            invoice_color = "orange"
-
-        if invoice_display_date:
-            week_num, _ = get_week_number_and_label(invoice_display_date, start_date)
-            # Use the week_label from all_weeks for consistency
-            week_label = weeks_data[week_num]["label"] if week_num in weeks_data else ""
-
-            invoice_weeks.append({
-                "week_number": week_num,
-                "week_label": week_label,
-                "milestone_code": milestone_code,
-                "status": invoice_status,
-                "color": invoice_color,
-                "date": invoice_display_date.isoformat()
-            })
-
-        milestone_types_data["invoice"].append({
-            "id": milestone.get("id"),
-            "milestone_code": milestone_code,
-            "description": description,
-            "milestone_type": "invoice",
-            "date": invoice_display_date.isoformat() if invoice_display_date else None,
-            "weeks": invoice_weeks,
-            "invoice_status": milestone.get("invoice_status", ""),
-            "status": milestone.get("status", "")
-        })
+    # Sort weeks by number
+    sorted_week_nums = sorted(all_weeks_collected.keys())
+    weeks_range = {
+        "start_week": all_weeks_collected[sorted_week_nums[0]]["label"] if sorted_week_nums else "",
+        "end_week": all_weeks_collected[sorted_week_nums[-1]]["label"] if sorted_week_nums else "",
+        "total_weeks": len(all_weeks_collected)
+    }
 
     return {
         "project_id": project_id,
         "project_name": project.get("name", ""),
-        "practice": milestone_types_data["practice"],
-        "signoff": milestone_types_data["signoff"],
-        "invoice": milestone_types_data["invoice"],
-        "weeks_range": {
-            "start_week": weeks_data[0]["label"] if weeks_data else "",
-            "end_week": weeks_data[max(weeks_data.keys())]["label"] if weeks_data else "",
-            "total_weeks": len(weeks_data)
-        },
-        "all_weeks": weeks_data
+        "practice": practice_data,
+        "signoff": signoff_data,
+        "invoice": invoice_data,
+        "weeks_range": weeks_range,
+        "all_weeks": all_weeks_collected
     }
 
 
@@ -485,6 +624,73 @@ def get_dashboard_counters(database: Database) -> dict[str, int]:
         "blocked_projects": projects.count_documents(blocked_filter),
         "completed_projects": projects.count_documents(completed_filter),
     }
+
+
+def get_team_members_with_engagement(database: Database) -> list[dict[str, Any]]:
+    """
+    Get all team members with their engagement metrics aggregated from team_members_engagement collection.
+    
+    Returns:
+        List of team members with engagement_pct and other engagement data
+    """
+    team_members_collection = database["team_members"]
+    engagement_collection = database["team_members_engagement"]
+    
+    # Get all team members
+    team_members = [to_plain_document(doc) for doc in team_members_collection.find({})]
+    
+    # Enhance each team member with engagement data
+    result = []
+    for member in team_members:
+        member_id = member.get("id")
+        
+        # Get all engagement records for this member
+        engagements = list(engagement_collection.find({"team_member_id": member_id}))
+        
+        if engagements:
+            # Calculate average engagement percentage from engagement_level or engagement_percentage
+            engagement_levels = []
+            for eng in engagements:
+                # Try engagement_percentage first, then engagement_level
+                level = eng.get("engagement_percentage")
+                if level is None:
+                    level = eng.get("engagement_level")
+                
+                if level is not None:
+                    # Convert to float if it's a string
+                    try:
+                        level = float(level)
+                        engagement_levels.append(level)
+                    except (ValueError, TypeError):
+                        pass
+            
+            avg_engagement_pct = sum(engagement_levels) / len(engagement_levels) if engagement_levels else 0
+            
+            # Calculate total hours and tasks
+            total_hours = sum(eng.get("engagement_hours", 0) for eng in engagements)
+            total_tasks_completed = sum(eng.get("task_completed", 0) for eng in engagements)
+            total_tasks_pending = sum(eng.get("task_pending", 0) for eng in engagements)
+            project_count = len(engagements)
+            
+            # Add engagement data to member
+            member["engagement_pct"] = round(avg_engagement_pct, 2)
+            member["total_engagement_hours"] = total_hours
+            member["total_tasks_completed"] = total_tasks_completed
+            member["total_tasks_pending"] = total_tasks_pending
+            member["projects_assigned"] = project_count
+            member["engagements"] = [to_plain_document(eng) for eng in engagements]
+        else:
+            # No engagements found
+            member["engagement_pct"] = 0
+            member["total_engagement_hours"] = 0
+            member["total_tasks_completed"] = 0
+            member["total_tasks_pending"] = 0
+            member["projects_assigned"] = 0
+            member["engagements"] = []
+        
+        result.append(member)
+    
+    return result
 
 
 def list_records(database: Database, table: str, query_params: dict[str, str]) -> list[dict[str, Any]]:
@@ -536,11 +742,187 @@ def create_records(database: Database, table: str, payload: Any) -> list[dict[st
         if not documents:
             return []
         database[table].insert_many(documents)
+
+        # Regenerate week data for milestones
+        if table == "milestones":
+            for doc in documents:
+                project_id = doc.get("project_id")
+                if project_id:
+                    regenerate_project_milestone_weeks(database, project_id)
+
         return [to_plain_document(document) or {} for document in documents]
 
     document = normalize_on_insert(table, payload)
     database[table].insert_one(document)
+
+    # Regenerate week data for milestones
+    if table == "milestones":
+        project_id = document.get("project_id")
+        if project_id:
+            regenerate_project_milestone_weeks(database, project_id)
+
     return to_plain_document(document) or {}
+
+
+def update_milestone_health(database: Database, milestone_id: str, milestone_type: str, status: str, date: str | None = None) -> dict[str, Any] | None:
+    """
+    Update a specific milestone health type (practice, signoff, or invoice).
+
+    Args:
+        database: MongoDB database connection
+        milestone_id: ID of the milestone to update
+        milestone_type: Type of update - "practice", "signoff", or "invoice"
+        status: New status value
+        date: Optional date for signoff/invoice (when marked as "Done")
+
+    Returns:
+        Updated milestone document
+
+    Example:
+        # Update practice status
+        update_milestone_health(db, "m123", "practice", "At Risk")
+
+        # Mark signoff as done with date
+        update_milestone_health(db, "m123", "signoff", "Done", "2026-02-07")
+    """
+    if milestone_type not in {"practice", "signoff", "invoice"}:
+        raise HTTPException(status_code=400, detail=f"Invalid milestone type: {milestone_type}")
+
+    # Validate status values
+    if milestone_type == "practice":
+        valid_statuses = {"On Track", "At Risk", "Blocked", "Completed"}
+        if status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"Invalid practice status: {status}")
+        update_dict = {"status": status}
+
+    elif milestone_type == "signoff":
+        valid_statuses = {"Done", "Pending"}
+        if status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"Invalid signoff status: {status}")
+        update_dict = {"client_signoff_status": status}
+        if status == "Done" and date:
+            update_dict["signedoff_date"] = date
+
+    elif milestone_type == "invoice":
+        valid_statuses = {"Done", "Pending"}
+        if status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"Invalid invoice status: {status}")
+        update_dict = {"invoice_status": status}
+        if status == "Done" and date:
+            update_dict["invoice_raised_date"] = date
+
+    # Perform the update
+    return patch_record(database, "milestones", milestone_id, update_dict)
+
+
+
+def update_week_status(
+    database: Database,
+    milestone_id: str,
+    milestone_type: str,
+    week_number: int,
+    payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """
+    Update status for a specific week in a milestone.
+
+    If the week exists, it will be updated.
+    If the week doesn't exist, it will be created and added to the array.
+    All other weeks remain unchanged.
+
+    Args:
+        database: MongoDB database connection
+        milestone_id: ID of the milestone to update
+        milestone_type: Type of update - "practice", "signoff", or "invoice"
+        week_number: The week number to update or create
+        payload: Week update payload containing:
+            {
+                "week_status": "At Risk",        // New status (required)
+                "week_label": "Feb 16-22, 2026", // Display label (required)
+                "color": "orange",               // Color indicator (required)
+                "date": "2026-02-20"             // Week date (required)
+            }
+
+    Returns:
+        Updated milestone document with the week added/updated
+
+    Example:
+        # Update existing week 2
+        update_week_status(
+            db, "m1", "practice", 2,
+            {
+                "week_status": "At Risk",
+                "week_label": "Feb 16-22, 2026",
+                "color": "orange",
+                "date": "2026-02-20"
+            }
+        )
+
+        # Create new week 5 if it doesn't exist
+        update_week_status(
+            db, "m1", "practice", 5,
+            {
+                "week_status": "On Track",
+                "week_label": "Mar 9-15, 2026",
+                "color": "green",
+                "date": "2026-03-09"
+            }
+        )
+    """
+    # Validate milestone type
+    if milestone_type not in {"practice", "signoff", "invoice"}:
+        raise HTTPException(status_code=400, detail="Invalid milestone type")
+
+    # Get the milestone
+    milestone = database["milestones"].find_one({"id": milestone_id})
+    if not milestone:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    # Get the appropriate weeks array key
+    if milestone_type == "practice":
+        weeks_key = "practice_weeks"
+    elif milestone_type == "signoff":
+        weeks_key = "signoff_weeks"
+    else:  # invoice
+        weeks_key = "invoice_weeks"
+
+    # Get the weeks array
+    weeks_array = milestone.get(weeks_key, [])
+
+    # Find and update the week, or create it if it doesn't exist
+    updated = False
+    for i, week in enumerate(weeks_array):
+        if week.get("week_number") == week_number:
+            # Update existing week with new data
+            weeks_array[i]["status"] = payload.get("week_status", week.get("status"))
+            weeks_array[i]["color"] = payload.get("color", week.get("color"))
+            weeks_array[i]["week_label"] = payload.get("week_label", week.get("week_label"))
+            weeks_array[i]["date"] = payload.get("date", week.get("date"))
+            updated = True
+            break
+
+    if not updated:
+        # Create new week if it doesn't exist
+        new_week = {
+            "week_number": week_number,
+            "status": payload.get("week_status"),
+            "color": payload.get("color"),
+            "week_label": payload.get("week_label"),
+            "date": payload.get("date")
+        }
+        weeks_array.append(new_week)
+        # Sort by week_number to maintain chronological order
+        weeks_array.sort(key=lambda w: w.get("week_number", 0))
+
+    # Save updated weeks array
+    database["milestones"].update_one(
+        {"id": milestone_id},
+        {"$set": {weeks_key: weeks_array, "updated_at": utc_now_iso()}}
+    )
+
+    # Return updated milestone
+    updated_milestone = database["milestones"].find_one({"id": milestone_id})
+    return to_plain_document(updated_milestone)
 
 
 def patch_record(database: Database, table: str, record_id: str, changes: Any) -> dict[str, Any] | None:
@@ -555,6 +937,16 @@ def patch_record(database: Database, table: str, record_id: str, changes: Any) -
 
     database[table].update_one({"id": str(record_id)}, {"$set": next_changes})
     updated = database[table].find_one({"id": str(record_id)})
+
+    # Regenerate week data for milestones if relevant fields changed
+    if table == "milestones" and updated:
+        project_id = updated.get("project_id")
+        # Check if any week-generating fields were modified
+        week_fields = {"actual_start", "actual_end_eta", "status", "client_signoff_status",
+                      "signedoff_date", "invoice_status", "invoice_raised_date"}
+        if project_id and any(field in next_changes for field in week_fields):
+            regenerate_project_milestone_weeks(database, project_id)
+
     return to_plain_document(updated)
 
 
@@ -574,6 +966,13 @@ def replace_record(database: Database, table: str, record_id: str, replacement: 
 
     database[table].replace_one({"id": str(record_id)}, next_document)
     updated = database[table].find_one({"id": str(record_id)})
+
+    # Regenerate week data for milestones
+    if table == "milestones" and updated:
+        project_id = updated.get("project_id")
+        if project_id:
+            regenerate_project_milestone_weeks(database, project_id)
+
     return to_plain_document(updated) or {}
 
 

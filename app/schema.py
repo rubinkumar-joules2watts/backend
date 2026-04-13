@@ -14,6 +14,7 @@ TableName = Literal[
     "audit_log",
     "project_updates",
     "project_documents",
+    "team_members_engagement",
 ]
 
 
@@ -51,9 +52,17 @@ class WeekMarker(BaseModel):
     """Represents a milestone marker on a specific week."""
     week_number: int
     week_label: str  # e.g., "Jan 1", "Feb 2"
-    status: str  # "On Track", "At Risk", "Blocked", "Completed"
-    color: str  # "green", "orange", "red", "blue"
-    type: str  # "eta" or "actual"
+    status: str  # "On Track", "At Risk", "Blocked", "Completed", "Done", "Pending"
+    color: str  # "green", "orange", "red", "blue", "gray"
+    date: str  # ISO format date
+
+
+class WeekData(BaseModel):
+    """Week-wise milestone data stored in database."""
+    week_number: int
+    week_label: str  # e.g., "Feb 2-8, 2025"
+    status: str  # Status for that specific week
+    color: str  # Color code for that week
     date: str  # ISO format date
 
 
