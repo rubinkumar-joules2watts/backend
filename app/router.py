@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from .config import UPLOADS_DIR
 from .db import get_database
+from .document_parser import extract_proposal_from_document
 from .service import (
     create_records,
     delete_record,
@@ -25,6 +30,32 @@ from .service import (
 
 
 router = APIRouter()
+logger = logging.getLogger("delivery_tracker.api")
+
+if not logger.handlers:
+    logs_dir = Path(__file__).resolve().parent.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = RotatingFileHandler(
+        logs_dir / "api_extract.log",
+        maxBytes=2 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.propagate = False
 
 
 @router.get("/health")
@@ -158,6 +189,41 @@ def upload_file(
     category: str | None = Form(None),
 ) -> dict[str, Any]:
     return save_upload(get_database(), file, project_id, update_id, category)
+
+
+@router.post("/documents/extract")
+async def extract_document(file: UploadFile = File(...)) -> dict[str, Any]:
+    request_id = str(uuid4())[:8]
+    started_at = perf_counter()
+    logger.info("extract_api_start request_id=%s filename=%s", request_id, file.filename)
+
+    file_bytes = await file.read()
+    try:
+        result = extract_proposal_from_document(file.filename or "document", file_bytes)
+    except Exception:
+        elapsed_ms = int((perf_counter() - started_at) * 1000)
+        logger.exception(
+            "extract_api_error request_id=%s filename=%s bytes=%s ms=%s",
+            request_id,
+            file.filename,
+            len(file_bytes),
+            elapsed_ms,
+        )
+        raise
+
+    elapsed_ms = int((perf_counter() - started_at) * 1000)
+    proposal = result.get("proposal", {})
+    logger.info(
+        "extract_api_success request_id=%s filename=%s bytes=%s ms=%s milestones=%s resources=%s warnings=%s",
+        request_id,
+        file.filename,
+        len(file_bytes),
+        elapsed_ms,
+        len(proposal.get("milestones", [])),
+        len(proposal.get("resources", [])),
+        len(proposal.get("warnings", [])),
+    )
+    return result
 
 
 @router.get("/files/{file_path:path}")

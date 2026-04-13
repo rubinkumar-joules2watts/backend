@@ -141,3 +141,6 @@ uploads/
 *.log
 .vercel
 .env*.local
+*.MD
+!.README.md
+sample data/
