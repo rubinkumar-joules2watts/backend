@@ -22,6 +22,7 @@ from .service import (
     get_team_members_with_engagement,
     list_records,
     patch_record,
+    remove_week_status,
     replace_record,
     save_upload,
     update_milestone_health,
@@ -179,6 +180,26 @@ def update_week_status_endpoint(
         Updated milestone with the week status changed
     """
     return update_week_status(get_database(), milestone_id, milestone_type, week_number, payload)
+
+
+@router.delete("/milestones/{milestone_id}/health/{milestone_type}/week/{week_number}")
+def clear_week_status_endpoint(
+    milestone_id: str,
+    milestone_type: str,
+    week_number: int,
+) -> dict[str, Any] | None:
+    """
+    Clear status for a specific week in a milestone (remove the entry).
+
+    Args:
+        milestone_id: The ID of the milestone
+        milestone_type: The type of milestone - "practice", "signoff", or "invoice"
+        week_number: The week number to clear
+
+    Returns:
+        Updated milestone with the week entry removed
+    """
+    return remove_week_status(get_database(), milestone_id, milestone_type, week_number)
 
 
 @router.post("/upload")

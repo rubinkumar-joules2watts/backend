@@ -925,6 +925,58 @@ def update_week_status(
     return to_plain_document(updated_milestone)
 
 
+def remove_week_status(
+    database: Database,
+    milestone_id: str,
+    milestone_type: str,
+    week_number: int,
+) -> dict[str, Any] | None:
+    """
+    Remove status for a specific week in a milestone (clear the entry).
+
+    Args:
+        database: MongoDB database connection
+        milestone_id: ID of the milestone to update
+        milestone_type: Type of update - "practice", "signoff", or "invoice"
+        week_number: The week number to remove
+
+    Returns:
+        Updated milestone document with the week removed
+    """
+    # Validate milestone type
+    if milestone_type not in {"practice", "signoff", "invoice"}:
+        raise HTTPException(status_code=400, detail="Invalid milestone type")
+
+    # Get the milestone
+    milestone = database["milestones"].find_one({"id": milestone_id})
+    if not milestone:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    # Get the appropriate weeks array key
+    if milestone_type == "practice":
+        weeks_key = "practice_weeks"
+    elif milestone_type == "signoff":
+        weeks_key = "signoff_weeks"
+    else:  # invoice
+        weeks_key = "invoice_weeks"
+
+    # Get the weeks array
+    weeks_array = milestone.get(weeks_key, [])
+
+    # Remove the week entry
+    weeks_array = [w for w in weeks_array if w.get("week_number") != week_number]
+
+    # Save updated weeks array
+    database["milestones"].update_one(
+        {"id": milestone_id},
+        {"$set": {weeks_key: weeks_array, "updated_at": utc_now_iso()}}
+    )
+
+    # Return updated milestone
+    updated_milestone = database["milestones"].find_one({"id": milestone_id})
+    return to_plain_document(updated_milestone)
+
+
 def patch_record(database: Database, table: str, record_id: str, changes: Any) -> dict[str, Any] | None:
     ensure_table(table)
 
