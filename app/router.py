@@ -14,6 +14,7 @@ from .config import UPLOADS_DIR
 from .db import get_database
 from .document_parser import extract_proposal_from_document
 from .service import (
+    auto_allocate_resources,
     create_records,
     delete_record,
     get_dashboard_counters,
@@ -24,6 +25,7 @@ from .service import (
     patch_record,
     replace_record,
     save_upload,
+    search_resources,
     update_milestone_health,
     update_week_status,
 )
@@ -300,6 +302,56 @@ def get_team_member_engagements(member_id: str) -> list[dict[str, Any]]:
         List of engagement records for that team member
     """
     return list_records(get_database(), "team_members_engagement", {"team_member_id": member_id})
+
+
+@router.post("/resources/search")
+def search_resources_endpoint(payload: Any = Body(...)) -> dict[str, Any]:
+    """
+    Search team members matching required skills and availability.
+
+    Body:
+        {
+            "skills": ["Python", "DevOps", ...],
+            "bandwidth_needed": 100,
+            "project_start": "2026-04-13",
+            "project_end": "2026-07-06"
+        }
+
+    Returns members sorted by composite score (70% skill + 30% availability).
+    """
+    return search_resources(
+        get_database(),
+        required_skills=payload.get("skills", []),
+        bandwidth_needed=int(payload.get("bandwidth_needed", 100)),
+        required_role=payload.get("role"),
+        project_start=payload.get("project_start"),
+        project_end=payload.get("project_end"),
+    )
+
+
+@router.post("/resources/auto-allocate")
+def auto_allocate_endpoint(payload: Any = Body(...)) -> list[dict[str, Any]]:
+    """
+    Auto-allocate team members to resource slots.
+
+    Body:
+        {
+            "resources": [
+                {"id": "r1", "role": "Project Manager", "skills": [...], "bandwidth": 100},
+                ...
+            ],
+            "project_start": "2026-04-13",
+            "project_end": "2026-07-06"
+        }
+
+    Each member is assigned at most once; minimum skill score 50, minimum availability 20%.
+    """
+    return auto_allocate_resources(
+        get_database(),
+        resources_input=payload.get("resources", []),
+        project_start=payload.get("project_start"),
+        project_end=payload.get("project_end"),
+    )
 
 
 @router.get("/{table}")
