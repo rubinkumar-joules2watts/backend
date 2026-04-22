@@ -26,6 +26,7 @@ from .service import (
     get_team_members_with_engagement,
     list_records,
     patch_record,
+    remove_week_status,
     replace_record,
     save_upload,
     search_resources,
