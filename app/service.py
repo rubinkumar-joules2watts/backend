@@ -1623,16 +1623,52 @@ async def upload_to_cloud(
     if category:
         file_details["category"] = category
 
-    document = normalize_on_insert("project_documents", file_details)
-    database["project_documents"].insert_one(document)
+    query: dict[str, Any] = {"project_id": project_id}
+    if category:
+        query["category"] = category
+    existing_doc = database["project_documents"].find_one(query)
+
+    if existing_doc:
+        # Find next free path slot: path → path2 → path3 → ...
+        path_key = "path"
+        counter = 2
+        while existing_doc.get(path_key):
+            path_key = f"path{counter}"
+            counter += 1
+        name_key = "name" if path_key == "path" else f"name{path_key[4:]}"
+        database["project_documents"].update_one(
+            {"id": existing_doc["id"]},
+            {"$set": {path_key: blob_url, name_key: safe_name}},
+        )
+        result_doc = to_plain_document(
+            database["project_documents"].find_one({"id": existing_doc["id"]})
+        ) or {}
+    else:
+        document = normalize_on_insert("project_documents", file_details)
+        database["project_documents"].insert_one(document)
+        result_doc = to_plain_document(document) or {}
 
     if update_id:
-        database["project_updates"].update_one(
-            {"id": update_id},
-            {"$set": {"file_path": blob_url, "file_name": safe_name}},
-        )
+        existing_update = database["project_updates"].find_one({"id": update_id})
+        if existing_update and existing_update.get("file_path"):
+            # Find next free path slot: file_path → file_path2 → file_path3 → ...
+            path_key = "file_path"
+            counter = 2
+            while existing_update.get(path_key):
+                path_key = f"file_path{counter}"
+                counter += 1
+            name_key = "file_name" if path_key == "file_path" else f"file_name{path_key[9:]}"
+            database["project_updates"].update_one(
+                {"id": update_id},
+                {"$set": {path_key: blob_url, name_key: safe_name}},
+            )
+        else:
+            database["project_updates"].update_one(
+                {"id": update_id},
+                {"$set": {"file_path": blob_url, "file_name": safe_name}},
+            )
 
-    return to_plain_document(document) or {}
+    return result_doc
 
 
 async def get_skills_for_designation(designation: str, azure: Any) -> dict[str, Any]:
