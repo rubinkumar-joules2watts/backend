@@ -436,6 +436,49 @@ def regenerate_project_milestone_weeks(database: Database, project_id: str) -> N
         )
 
 
+def _count_weeks_in_month(year: int, month: int) -> int:
+    """
+    Count rows a Sunday-first calendar widget shows for the given month.
+    When the 1st falls on Sunday, the preceding week is included as a header row
+    (matching the frontend calendar behavior visible in November 2026).
+    """
+    first = datetime(year, month, 1)
+    # days_since_sunday: Sun=0, Mon=1, ..., Sat=6
+    days_since_sunday = (first.weekday() + 1) % 7
+    # If 1st is Sunday, step back a full week (include prior-month header row)
+    cal_start = first - timedelta(days=7 if days_since_sunday == 0 else days_since_sunday)
+    last = (
+        datetime(year + 1, 1, 1) - timedelta(days=1)
+        if month == 12
+        else datetime(year, month + 1, 1) - timedelta(days=1)
+    )
+    cal_end = last + timedelta(days=(5 - last.weekday()) % 7)
+    return (cal_end - cal_start).days // 7 + 1
+
+
+def generate_calendar_months(start_date: datetime) -> list[dict[str, Any]]:
+    """
+    Generate month entries from start_date's month through December 2026.
+    Each entry includes the count of Mon-Sun weeks whose Monday falls in that month.
+    """
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+    current = start_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = datetime(2026, 12, 1, tzinfo=timezone.utc)
+    months = []
+    while current <= end:
+        months.append({
+            "month": current.month,
+            "year": current.year,
+            "month_name": current.strftime("%B"),
+            "month_year": current.strftime("%b %Y"),
+            "weeks_count": _count_weeks_in_month(current.year, current.month),
+        })
+        current = (current.replace(month=current.month + 1) if current.month < 12
+                   else current.replace(year=current.year + 1, month=1))
+    return months
+
+
 def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     """
     Get milestone health tracker data for a project.
@@ -455,6 +498,16 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     milestones = list(database["milestones"].find({"project_id": str(project_id)}))
     if not milestones:
         raise HTTPException(status_code=404, detail="No milestones found for this project")
+
+    # Collect planned_start dates to build calendar month range
+    planned_starts: list[datetime] = []
+    for m in milestones:
+        ps = parse_date(m.get("planned_start") or m.get("plannedStart"))
+        if ps:
+            planned_starts.append(ps)
+
+    calendar_start_date = min(planned_starts) if planned_starts else datetime.now(timezone.utc)
+    calendar_months = generate_calendar_months(calendar_start_date)
 
     # Collect all week data from milestones
     practice_data = []
@@ -585,7 +638,9 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
                 "end_week": "",
                 "total_weeks": 0
             },
-            "all_weeks": {}
+            "all_weeks": {},
+            "calendar_start": calendar_start_date.strftime("%b %Y"),
+            "calendar_months": calendar_months,
         }
 
     # Sort weeks by number
@@ -603,7 +658,9 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         "signoff": signoff_data,
         "invoice": invoice_data,
         "weeks_range": weeks_range,
-        "all_weeks": all_weeks_collected
+        "all_weeks": all_weeks_collected,
+        "calendar_start": calendar_start_date.strftime("%b %Y"),
+        "calendar_months": calendar_months,
     }
 
 
@@ -968,56 +1025,88 @@ def _build_engagement_map(database: Database) -> dict[str, float]:
     return eng_map
 
 
+def _filter_members_by_resource_type(
+    members: list[dict],
+    resource_type: str | None,
+) -> list[dict]:
+    """
+    Filter members by resource_type.
+    - "Internal": resource_type == "Internal" OR member_type == "Consultant"
+    - "External": resource_type == "External"
+    - None / anything else: no filter (return all)
+    """
+    if not resource_type:
+        return members
+    rt = resource_type.strip().lower()
+    if rt == "internal":
+        return [
+            m for m in members
+            if (m.get("resource_type") or "").strip().lower() == "internal"
+            or (m.get("member_type") or "").strip().lower() == "consultant"
+        ]
+    if rt == "external":
+        return [
+            m for m in members
+            if (m.get("resource_type") or "").strip().lower() == "external"
+        ]
+    return members
+
+
+def _resolve_resource_type(member: dict) -> str:
+    """Derive the display resource type label for a member."""
+    if (member.get("member_type") or "").strip().lower() == "consultant":
+        return "Consultant"
+    rt = (member.get("resource_type") or "").strip()
+    return rt if rt else "Internal"
+
+
 def search_resources(
     database: Database,
     required_skills: list[str],
-    bandwidth_needed: int,
-    required_role: str | None = None,
-    project_start: str | None = None,
-    project_end: str | None = None,
+    bandwidth_needed: int = 0,
+    **_: Any,
 ) -> dict[str, Any]:
     """
     Search team members matching required skills and availability.
-    Composite score = 60% skill match + 20% role match + 20% bandwidth availability.
-    Includes active project allocations with name and timeline per member.
+    Composite score = 70% skill match + 30% bandwidth availability.
+    Skills are matched strictly against the member's skills array.
     """
-    # Include members where is_active is True OR the field is absent (not explicitly deactivated)
     raw_members = list(database["team_members"].find({"is_active": {"$ne": False}}))
     members = [to_plain_document(doc) for doc in raw_members if doc]
 
     project_lookup = _build_project_timeline_lookup(database)
     eng_detail = _build_engagement_detail(database, project_lookup)
 
-    # Batch LLM call: one request for ALL member roles at once
-    member_role_list = [m.get("role", "") for m in members]
-    llm_role_scores = _llm_score_roles_batch(required_role or "", member_role_list)
-
     results: list[dict[str, Any]] = []
-    for idx, member in enumerate(members):
+    for member in members:
         member_id = member.get("id", "")
         projects = eng_detail.get(member_id, [])
         committed = sum(p["engagement_level"] for p in projects)
         avail_bw = round(max(0.0, 100.0 - committed), 1)
 
-        member_skills = _normalize_skills(member.get("skills") or member.get("Skills"))
-        effective = _effective_skills(member)
-        skill_result = _score_skills(required_skills, effective)
-        role_score = llm_role_scores[idx]
+        # Skip members who don't have enough bandwidth when a minimum is specified
+        if bandwidth_needed and avail_bw < bandwidth_needed:
+            continue
 
-        # Composite: 60% skill relevance + 30% role match + 10% bandwidth availability
-        composite = round(skill_result["score"] * 0.6 + role_score * 0.3 + avail_bw * 0.1)
+        # Match strictly against the skills array — no role-token fallback
+        member_skills = _normalize_skills(member.get("skills") or member.get("Skills"))
+        skill_result = _score_skills(required_skills, member_skills)
+
+        # Composite: 70% skill match + 30% bandwidth availability
+        composite = round(skill_result["score"] * 0.7 + avail_bw * 0.3)
 
         results.append({
             "id": member_id,
             "name": member.get("name", ""),
             "role": member.get("role", ""),
+            "member_type": member.get("member_type", ""),
+            "resource_type": _resolve_resource_type(member),
             "initials": member.get("initials", ""),
             "color_hex": member.get("color_hex", "#6366f1"),
-            "skills": member_skills if member_skills else effective,
+            "skills": member_skills,
             "available_bandwidth": avail_bw,
             "committed_bandwidth": round(committed, 1),
             "skill_score": skill_result["score"],
-            "role_score": role_score,
             "matched_skills": skill_result["matched"],
             "partial_skills": skill_result["partial"],
             "composite_score": composite,
@@ -1025,14 +1114,6 @@ def search_resources(
         })
 
     results.sort(key=lambda x: (-x["composite_score"], -x["available_bandwidth"]))
-
-    # The LLM is the sole arbiter of relevance.
-    # Drop only members the LLM explicitly scored 0 on role AND who have no skill match.
-    # This preserves members like "Software Engineer" for a "Python Developer" search
-    # (same engineering function, different language — LLM scores them 20-40, not 0).
-    if required_role or required_skills:
-        relevant = [r for r in results if r["role_score"] > 0 or r["skill_score"] > 0]
-        results = relevant if relevant else results[:5]
 
     return {"members": results, "total": len(results)}
 
@@ -1340,6 +1421,36 @@ def update_week_status(
     return to_plain_document(updated_milestone)
 
 
+def delete_week_status(
+    database: Database,
+    milestone_id: str,
+    milestone_type: str,
+    week_number: int,
+) -> dict[str, Any] | None:
+    """Remove a specific week entry from a milestone's weeks array."""
+    if milestone_type not in {"practice", "signoff", "invoice"}:
+        raise HTTPException(status_code=400, detail="Invalid milestone type")
+
+    milestone = database["milestones"].find_one({"id": milestone_id})
+    if not milestone:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    weeks_key = f"{milestone_type}_weeks"
+    weeks_array = milestone.get(weeks_key, [])
+    filtered = [w for w in weeks_array if w.get("week_number") != week_number]
+
+    if len(filtered) == len(weeks_array):
+        raise HTTPException(status_code=404, detail=f"Week {week_number} not found")
+
+    database["milestones"].update_one(
+        {"id": milestone_id},
+        {"$set": {weeks_key: filtered, "updated_at": utc_now_iso()}}
+    )
+
+    updated = database["milestones"].find_one({"id": milestone_id})
+    return to_plain_document(updated)
+
+
 def patch_record(database: Database, table: str, record_id: str, changes: Any) -> dict[str, Any] | None:
     ensure_table(table)
 
@@ -1444,3 +1555,104 @@ def save_upload(
         )
 
     return to_plain_document(document) or {}
+
+
+CLOUD_UPLOAD_FOLDER = "centralized_delivery_tracker_records"
+
+
+async def upload_to_cloud(
+    database: Database,
+    file: UploadFile,
+    settings: Any,
+    project_id: str,
+    update_id: str | None = None,
+    category: str | None = None,
+) -> dict[str, Any]:
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+
+    account_name = settings.azure_storage_account_name
+    account_key = settings.azure_storage_account_key
+    container_name = settings.azure_storage_container_name
+
+    if not account_name or not account_key or not container_name:
+        raise HTTPException(
+            status_code=500,
+            detail="Azure Storage is not configured. Set AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY, and AZURE_STORAGE_CONTAINER_NAME.",
+        )
+
+    safe_name = Path(file.filename or "upload.bin").name
+    timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
+    blob_name = f"{CLOUD_UPLOAD_FOLDER}/{timestamp}-{safe_name}"
+
+    connection_string = (
+        f"DefaultEndpointsProtocol=https;"
+        f"AccountName={account_name};"
+        f"AccountKey={account_key};"
+        f"EndpointSuffix=core.windows.net"
+    )
+
+    content = await file.read()
+
+    try:
+        blob_client = BlobServiceClient.from_connection_string(connection_string).get_blob_client(
+            container=container_name,
+            blob=blob_name,
+        )
+        blob_client.upload_blob(
+            content,
+            overwrite=True,
+            content_settings=ContentSettings(content_type=file.content_type or "application/octet-stream"),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Azure Blob upload failed: {exc}") from exc
+
+    blob_url = f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}"
+
+    file_details: dict[str, Any] = {
+        "name": safe_name,
+        "size": len(content),
+        "type": file.content_type or "application/octet-stream",
+        "path": blob_url,
+        "blob_name": blob_name,
+        "project_id": project_id,
+        "storage": "azure_blob",
+    }
+    if category:
+        file_details["category"] = category
+
+    document = normalize_on_insert("project_documents", file_details)
+    database["project_documents"].insert_one(document)
+
+    if update_id:
+        database["project_updates"].update_one(
+            {"id": update_id},
+            {"$set": {"file_path": blob_url, "file_name": safe_name}},
+        )
+
+    return to_plain_document(document) or {}
+
+
+async def get_skills_for_designation(designation: str, azure: Any) -> dict[str, Any]:
+    from .ai.azure_openai_service import AzureChatConfig
+    from .ai.prompts import DESIGNATION_SKILLS_SYSTEM, DESIGNATION_SKILLS_USER
+
+    designation = designation.strip()
+    if not designation:
+        raise HTTPException(status_code=400, detail="Designation is required")
+
+    prompt = DESIGNATION_SKILLS_USER.format(designation=designation)
+    config = AzureChatConfig(temperature=0.2, max_tokens=2048)
+
+    result = await azure.generate_json(
+        prompt=prompt,
+        system_prompt=DESIGNATION_SKILLS_SYSTEM,
+        config=config,
+    )
+
+    if not result or not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="LLM returned an unexpected response")
+
+    return result

@@ -7,12 +7,14 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from .config import UPLOADS_DIR
 from .db import get_database
 from .document_parser import extract_proposal_from_document
+from .ai.dependencies import get_gpt4omini_service
+from .ai.azure_openai_service import AzureOpenAIService
 from .service import (
     auto_allocate_resources,
     create_records,
@@ -20,14 +22,17 @@ from .service import (
     get_dashboard_counters,
     get_milestone_health,
     get_record,
+    get_skills_for_designation,
     get_team_members_with_engagement,
     list_records,
     patch_record,
     replace_record,
     save_upload,
     search_resources,
+    delete_week_status,
     update_milestone_health,
     update_week_status,
+    upload_to_cloud,
 )
 
 
@@ -183,6 +188,45 @@ def update_week_status_endpoint(
     return update_week_status(get_database(), milestone_id, milestone_type, week_number, payload)
 
 
+@router.delete("/milestones/{milestone_id}/health/{milestone_type}/week/{week_number}")
+def delete_week_status_endpoint(
+    milestone_id: str,
+    milestone_type: str,
+    week_number: int,
+) -> dict[str, Any] | None:
+    """Delete a specific week entry from a milestone's weeks array."""
+    return delete_week_status(get_database(), milestone_id, milestone_type, week_number)
+
+
+@router.post("/upload_cloud")
+async def upload_file_cloud(
+    request: Request,
+    file: UploadFile = File(...),
+    project_id: str = Form(...),
+    update_id: str | None = Form(None),
+    category: str | None = Form(None),
+) -> dict[str, Any]:
+    """
+    Upload any file to Azure Blob Storage and record it in project_documents.
+
+    Form fields:
+        file        — the file to upload (required)
+        project_id  — project to associate the document with (required)
+        update_id   — project update to link the file to (optional)
+        category    — document category (optional)
+
+    Stores under: centralized_delivery_tracker_records/{timestamp}-{filename}
+    """
+    return await upload_to_cloud(
+        get_database(),
+        file,
+        request.app.state.settings,
+        project_id=project_id,
+        update_id=update_id,
+        category=category,
+    )
+
+
 @router.post("/upload")
 def upload_file(
     file: UploadFile = File(...),
@@ -311,21 +355,24 @@ def search_resources_endpoint(payload: Any = Body(...)) -> dict[str, Any]:
 
     Body:
         {
-            "skills": ["Python", "DevOps", ...],
+            "skills": ["Python", "Docker", ...],
             "bandwidth_needed": 100,
+            "resource_type": "Internal",   // "Internal" | "External" | omit for all
             "project_start": "2026-04-13",
             "project_end": "2026-07-06"
         }
+
+    resource_type rules:
+        - "Internal" → members with resource_type="Internal" + Consultants
+        - "External" → members with resource_type="External" only
+        - omitted    → all active members
 
     Returns members sorted by composite score (70% skill + 30% availability).
     """
     return search_resources(
         get_database(),
         required_skills=payload.get("skills", []),
-        bandwidth_needed=int(payload.get("bandwidth_needed", 100)),
-        required_role=payload.get("role"),
-        project_start=payload.get("project_start"),
-        project_end=payload.get("project_end"),
+        bandwidth_needed=int(payload.get("bandwidth_needed", 0)),
     )
 
 
@@ -352,6 +399,34 @@ def auto_allocate_endpoint(payload: Any = Body(...)) -> list[dict[str, Any]]:
         project_start=payload.get("project_start"),
         project_end=payload.get("project_end"),
     )
+
+
+@router.post("/designations/skills")
+async def get_designation_skills(
+    payload: Any = Body(...),
+    azure: AzureOpenAIService = Depends(get_gpt4omini_service),
+) -> dict[str, Any]:
+    """
+    Return the skill set expected for a given designation, powered by Azure OpenAI (GPT-4o-mini).
+
+    Body:
+        {"designation": "Senior Software Engineer"}
+
+    Response shape:
+        {
+            "designation": "Senior Software Engineer",
+            "level": "Senior",
+            "technical_skills": [...],
+            "tools_and_technologies": [...],
+            "soft_skills": [...],
+            "domain_knowledge": [...],
+            "certifications": [...]
+        }
+    """
+    designation = (payload.get("designation") or "").strip() if isinstance(payload, dict) else ""
+    if not designation:
+        raise HTTPException(status_code=400, detail="designation is required in request body")
+    return await get_skills_for_designation(designation, azure)
 
 
 @router.get("/{table}")

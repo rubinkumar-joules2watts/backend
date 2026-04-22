@@ -36,6 +36,9 @@ class Settings:
     gpt4omini_endpoint: str
     gpt4omini_api_version: str
     gpt4omini_deployment_name: str
+    azure_storage_account_name: str
+    azure_storage_account_key: str
+    azure_storage_container_name: str
 
 
 def load_settings() -> Settings:
@@ -75,6 +78,10 @@ def load_settings() -> Settings:
     gpt4omini_api_version = (os.getenv("GPT4OMINI_API_VERSION") or "2024-12-01-preview").strip() or "2024-12-01-preview"
     gpt4omini_deployment_name = (os.getenv("GPT4OMINI_DEPLOYMENT_NAME") or "gpt-4o-mini").strip() or "gpt-4o-mini"
 
+    azure_storage_account_name = (os.getenv("AZURE_STORAGE_ACCOUNT_NAME") or "").strip()
+    azure_storage_account_key = (os.getenv("AZURE_STORAGE_ACCOUNT_KEY") or "").strip()
+    azure_storage_container_name = (os.getenv("AZURE_STORAGE_CONTAINER_NAME") or "").strip()
+
     return Settings(
         mongo_uri=mongo_uri,
         mongo_db_name=db_name,
@@ -86,4 +93,7 @@ def load_settings() -> Settings:
         gpt4omini_endpoint=gpt4omini_endpoint,
         gpt4omini_api_version=gpt4omini_api_version,
         gpt4omini_deployment_name=gpt4omini_deployment_name,
+        azure_storage_account_name=azure_storage_account_name,
+        azure_storage_account_key=azure_storage_account_key,
+        azure_storage_container_name=azure_storage_container_name,
     )
