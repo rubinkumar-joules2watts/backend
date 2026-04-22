@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
 	"beautifulsoup4==4.14.3",
 	"fastapi==0.135.3",
+	"httpx==0.28.1",
 	"pymupdf==1.27.2.2",
 	"pdfplumber==0.11.9",
 	"python-docx==1.2.0",
@@ -17,12 +18,14 @@ dependencies = [
 	"annotated-doc==0.0.4",
 	"annotated-types==0.7.0",
 	"anyio==4.13.0",
+	"certifi==2026.2.25",
 	"cffi==2.0.0",
 	"charset-normalizer==3.4.7",
 	"click==8.3.1",
 	"cryptography==46.0.7",
 	"dnspython==2.8.0",
 	"h11==0.16.0",
+	"httpcore==1.0.9",
 	"idna==3.11",
 	"lxml==6.0.4",
 	"pdfminer-six==20251230",
@@ -35,6 +38,7 @@ dependencies = [
 	"starlette==1.0.0",
 	"typing-extensions==4.15.0",
 	"typing-inspection==0.4.2",
+	"azure-storage-blob>=12.23.0",
 ]
 
 [project.scripts]

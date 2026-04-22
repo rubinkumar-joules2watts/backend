@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import json
+import logging
+import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 from uuid import uuid4
+
+import httpx
 
 from fastapi import HTTPException, UploadFile
 from pymongo.database import Database
@@ -430,6 +436,49 @@ def regenerate_project_milestone_weeks(database: Database, project_id: str) -> N
         )
 
 
+def _count_weeks_in_month(year: int, month: int) -> int:
+    """
+    Count rows a Sunday-first calendar widget shows for the given month.
+    When the 1st falls on Sunday, the preceding week is included as a header row
+    (matching the frontend calendar behavior visible in November 2026).
+    """
+    first = datetime(year, month, 1)
+    # days_since_sunday: Sun=0, Mon=1, ..., Sat=6
+    days_since_sunday = (first.weekday() + 1) % 7
+    # If 1st is Sunday, step back a full week (include prior-month header row)
+    cal_start = first - timedelta(days=7 if days_since_sunday == 0 else days_since_sunday)
+    last = (
+        datetime(year + 1, 1, 1) - timedelta(days=1)
+        if month == 12
+        else datetime(year, month + 1, 1) - timedelta(days=1)
+    )
+    cal_end = last + timedelta(days=(5 - last.weekday()) % 7)
+    return (cal_end - cal_start).days // 7 + 1
+
+
+def generate_calendar_months(start_date: datetime) -> list[dict[str, Any]]:
+    """
+    Generate month entries from start_date's month through December 2026.
+    Each entry includes the count of Mon-Sun weeks whose Monday falls in that month.
+    """
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+    current = start_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = datetime(2026, 12, 1, tzinfo=timezone.utc)
+    months = []
+    while current <= end:
+        months.append({
+            "month": current.month,
+            "year": current.year,
+            "month_name": current.strftime("%B"),
+            "month_year": current.strftime("%b %Y"),
+            "weeks_count": _count_weeks_in_month(current.year, current.month),
+        })
+        current = (current.replace(month=current.month + 1) if current.month < 12
+                   else current.replace(year=current.year + 1, month=1))
+    return months
+
+
 def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     """
     Get milestone health tracker data for a project.
@@ -449,6 +498,16 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
     milestones = list(database["milestones"].find({"project_id": str(project_id)}))
     if not milestones:
         raise HTTPException(status_code=404, detail="No milestones found for this project")
+
+    # Collect planned_start dates to build calendar month range
+    planned_starts: list[datetime] = []
+    for m in milestones:
+        ps = parse_date(m.get("planned_start") or m.get("plannedStart"))
+        if ps:
+            planned_starts.append(ps)
+
+    calendar_start_date = min(planned_starts) if planned_starts else datetime.now(timezone.utc)
+    calendar_months = generate_calendar_months(calendar_start_date)
 
     # Collect all week data from milestones
     practice_data = []
@@ -579,7 +638,9 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
                 "end_week": "",
                 "total_weeks": 0
             },
-            "all_weeks": {}
+            "all_weeks": {},
+            "calendar_start": calendar_start_date.strftime("%b %Y"),
+            "calendar_months": calendar_months,
         }
 
     # Sort weeks by number
@@ -597,7 +658,9 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         "signoff": signoff_data,
         "invoice": invoice_data,
         "weeks_range": weeks_range,
-        "all_weeks": all_weeks_collected
+        "all_weeks": all_weeks_collected,
+        "calendar_start": calendar_start_date.strftime("%b %Y"),
+        "calendar_months": calendar_months,
     }
 
 
@@ -691,6 +754,439 @@ def get_team_members_with_engagement(database: Database) -> list[dict[str, Any]]
         result.append(member)
     
     return result
+
+
+# ── Resource Search & Auto-Allocation ────────────────────────────────────────
+
+
+def _normalize_skills(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(s).strip() for s in raw if str(s).strip()]
+    if isinstance(raw, str):
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return []
+
+
+def _score_skills(required: list[str], member_skills: list[str]) -> dict[str, Any]:
+    if not required:
+        return {"score": 0, "matched": [], "partial": []}
+    lower_skills = [s.lower() for s in member_skills]
+    matched: list[str] = []
+    partial: list[str] = []
+    for req in required:
+        r = req.lower().strip()
+        if any(s == r or r in s or s in r for s in lower_skills):
+            matched.append(req)
+        elif any(
+            w
+            for s in lower_skills
+            for w in s.split()
+            if len(w) > 3 and w in r
+        ):
+            partial.append(req)
+    score = round(((len(matched) + len(partial) * 0.5) / len(required)) * 100)
+    return {"score": score, "matched": matched, "partial": partial}
+
+
+def _effective_skills(member: dict) -> list[str]:
+    """
+    Return the member's skills for scoring.
+    When no explicit skills exist, derive tokens from the role so that
+    e.g. "Senior Python Engineer" still matches "Python" and "Senior".
+    Min 4 chars to avoid short abbreviations like "Dev" matching "Developer".
+    """
+    skills = _normalize_skills(member.get("skills") or member.get("Skills"))
+    if skills:
+        return skills
+    role = (member.get("role") or "").replace("-", " ").replace("/", " ")
+    return [w.strip() for w in role.split() if len(w.strip()) > 3]
+
+
+def _score_role_match(required_role: str, member_role: str) -> int:
+    """Score how well a member's role title matches the required role (0-100).
+    Min 4-char tokens to avoid short abbreviations creating false matches.
+    """
+    if not required_role or not member_role:
+        return 0
+    req_tokens = [w.lower() for w in required_role.replace("-", " ").replace("/", " ").split() if len(w) > 3]
+    mem_tokens = [w.lower() for w in member_role.replace("-", " ").replace("/", " ").split() if len(w) > 3]
+    if not req_tokens or not mem_tokens:
+        return 0
+    matched = sum(1 for rt in req_tokens if any(rt == mt or (len(rt) >= 5 and len(mt) >= 5 and (rt in mt or mt in rt)) for mt in mem_tokens))
+    return round(matched / len(req_tokens) * 100)
+
+
+_llm_role_cache: dict[str, list[int]] = {}
+
+_log = logging.getLogger(__name__)
+
+# Keyword sets for job-family classification used as a safety floor after LLM scoring.
+# When LLM gives 0 to a role that clearly belongs to the same job family as the required
+# role, we apply a minimum score of 20 — same-family roles are always worth showing.
+_FAMILY_KEYWORDS: dict[str, set[str]] = {
+    # devops checked BEFORE developer so "devops" doesn't match "developer" keywords
+    "devops": {
+        "devops", "infrastructure", "cloud", "sysadmin", "platform",
+        "site reliability", "sre", "kubernetes", "docker", "ci/cd",
+        "devsecops",
+    },
+    "developer": {
+        "developer", "engineer", "programmer", "coder",
+        "fullstack", "full-stack", "full stack",
+        "backend", "frontend", "front-end", "back-end",
+        "software", "application", "web developer", "mobile developer",
+        "android", "ios developer",
+        "python", "java developer", "javascript", "typescript", "react developer",
+        "golang", "rust developer", "scala", "kotlin", "swift developer",
+    },
+    "manager": {
+        "manager", "programme", "program manager", "project manager", "delivery manager",
+        "scrum", "agile", "product owner", "pod lead",
+        "director", "head of", "vp of", "chief",
+    },
+    "data": {
+        "data scientist", "data analyst", "data engineer", "analytics",
+        "machine learning", "ml engineer", "ai engineer", "nlp", "etl",
+        "business intelligence",
+    },
+    "qa": {
+        "qa", "quality assurance", "tester", "test engineer", "sdet",
+        "automation test",
+    },
+    "design": {
+        "designer", "ux", "ui designer", "product design", "visual designer",
+    },
+    "seo": {
+        "seo", "sem", "search engine", "content strategist", "marketing",
+    },
+}
+
+
+def _role_family(role: str) -> str | None:
+    lower = role.lower()
+    for family, keywords in _FAMILY_KEYWORDS.items():
+        if any(kw in lower for kw in keywords):
+            return family
+    return None
+
+
+def _llm_score_roles_batch(required_role: str, member_roles: list[str]) -> list[int]:
+    """
+    Use Gemini to semantically score how well each member role matches required_role.
+    Returns a list of scores 0–100 in the same order as member_roles.
+    Falls back to _score_role_match on any failure.
+    """
+    if not required_role or not member_roles:
+        return [_score_role_match(required_role, r) for r in member_roles]
+
+    cache_key = required_role + "|" + "||".join(member_roles)
+    if cache_key in _llm_role_cache:
+        return _llm_role_cache[cache_key]
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return [_score_role_match(required_role, r) for r in member_roles]
+
+    roles_numbered = "\n".join(f"{i + 1}. {role}" for i, role in enumerate(member_roles))
+    prompt = (
+        f'You are matching team members to a project resource slot.\n\n'
+        f'Required role: "{required_role}"\n\n'
+        f"First, identify the CORE JOB FUNCTION of the required role "
+        f"(e.g. 'writes application code', 'manages project delivery', 'handles infra/deployment', 'data/analytics', 'design/UX', 'SEO/marketing').\n\n"
+        f"Then score each member role 0–100 based on whether they share that same core function:\n"
+        f"- 80–100: Same core function, same or very similar specialization\n"
+        f"- 50–79:  Same core function, adjacent specialization (e.g. Project Manager ↔ Program Manager)\n"
+        f"- 20–49:  Same core function, different technology/stack/language — IMPORTANT: if the core function "
+        f"is 'writes application code', then Software Engineer, Java Developer, Full Stack Dev, Backend Dev, "
+        f"Mobile Dev, Web Developer all share this function and must score AT LEAST 20, regardless of language\n"
+        f"- 1–19:   Overlapping function (e.g. Architect touches code but is not primarily a developer)\n"
+        f"- 0:      Completely different core function — ONLY for roles with ZERO functional overlap "
+        f"(DevOps/Infra roles for PM or coding positions; SEO/Marketing for any tech role; HR/Finance for tech roles)\n\n"
+        f"Member roles:\n{roles_numbered}\n\n"
+        f"Return ONLY a JSON array of integers (one per role, same order). Nothing else."
+    )
+
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+                params={"key": api_key},
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512},
+                },
+            )
+            resp.raise_for_status()
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            m = re.search(r"\[[\d,\s]+\]", text)
+            if m:
+                scores = json.loads(m.group())
+                if len(scores) == len(member_roles):
+                    result = [min(100, max(0, int(s))) for s in scores]
+                    # Safety floor: if the LLM gave 0 to a role that clearly belongs
+                    # to the same job family as the required role, bump it to 20.
+                    # This handles the model's bias of treating "Software Engineer"
+                    # and "Software Developer" as different families.
+                    req_family = _role_family(required_role)
+                    if req_family:
+                        result = [
+                            max(score, 20) if score == 0 and _role_family(member_roles[i]) == req_family else score
+                            for i, score in enumerate(result)
+                        ]
+                    _llm_role_cache[cache_key] = result
+                    return result
+    except Exception as exc:
+        _log.warning("LLM role scoring failed, falling back to token match: %s", exc)
+
+    return [_score_role_match(required_role, r) for r in member_roles]
+
+
+def _build_project_timeline_lookup(database: Database) -> dict[str, dict[str, Any]]:
+    """Build project_id → {name, start_date, end_date} from projects + milestones."""
+    projects_by_id: dict[str, dict] = {}
+    for doc in database["projects"].find({}):
+        pid = doc.get("id", "")
+        if pid:
+            projects_by_id[pid] = {"name": doc.get("name", ""), "starts": [], "ends": []}
+
+    for m in database["milestones"].find({}):
+        pid = m.get("project_id", "")
+        if pid not in projects_by_id:
+            continue
+        # Support both camelCase (from proposal save) and snake_case (from health tracker)
+        start = (
+            m.get("actual_start")
+            or m.get("plannedStart")
+            or m.get("planned_start")
+        )
+        end = (
+            m.get("actual_end_eta")
+            or m.get("plannedEnd")
+            or m.get("planned_end")
+        )
+        if start:
+            projects_by_id[pid]["starts"].append(str(start)[:10])
+        if end:
+            projects_by_id[pid]["ends"].append(str(end)[:10])
+
+    lookup: dict[str, dict[str, Any]] = {}
+    for pid, data in projects_by_id.items():
+        starts = sorted(data["starts"])
+        ends = sorted(data["ends"])
+        lookup[pid] = {
+            "name": data["name"],
+            "start_date": starts[0] if starts else None,
+            "end_date": ends[-1] if ends else None,
+        }
+    return lookup
+
+
+def _build_engagement_detail(
+    database: Database,
+    project_lookup: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build member_id → list of project allocation details."""
+    detail: dict[str, list[dict[str, Any]]] = {}
+    for eng in database["team_members_engagement"].find({}):
+        member_id = eng.get("team_member_id", "")
+        if not member_id:
+            continue
+        project_id = eng.get("project_id", "")
+        raw = eng.get("engagement_level") or eng.get("engagement_percentage") or 0
+        try:
+            level = float(raw)
+        except (ValueError, TypeError):
+            level = 0.0
+        proj = project_lookup.get(project_id, {})
+        detail.setdefault(member_id, []).append({
+            "project_id": project_id,
+            "project_name": proj.get("name") or project_id,
+            "engagement_level": level,
+            "start_date": proj.get("start_date"),
+            "end_date": proj.get("end_date"),
+        })
+    return detail
+
+
+def _build_engagement_map(database: Database) -> dict[str, float]:
+    eng_map: dict[str, float] = {}
+    for eng in database["team_members_engagement"].find({}):
+        member_id = eng.get("team_member_id", "")
+        if not member_id:
+            continue
+        raw = eng.get("engagement_level") or eng.get("engagement_percentage") or 0
+        try:
+            level = float(raw)
+        except (ValueError, TypeError):
+            level = 0.0
+        eng_map[member_id] = eng_map.get(member_id, 0.0) + level
+    return eng_map
+
+
+def _filter_members_by_resource_type(
+    members: list[dict],
+    resource_type: str | None,
+) -> list[dict]:
+    """
+    Filter members by resource_type.
+    - "Internal": resource_type == "Internal" OR member_type == "Consultant"
+    - "External": resource_type == "External"
+    - None / anything else: no filter (return all)
+    """
+    if not resource_type:
+        return members
+    rt = resource_type.strip().lower()
+    if rt == "internal":
+        return [
+            m for m in members
+            if (m.get("resource_type") or "").strip().lower() == "internal"
+            or (m.get("member_type") or "").strip().lower() == "consultant"
+        ]
+    if rt == "external":
+        return [
+            m for m in members
+            if (m.get("resource_type") or "").strip().lower() == "external"
+        ]
+    return members
+
+
+def _resolve_resource_type(member: dict) -> str:
+    """Derive the display resource type label for a member."""
+    if (member.get("member_type") or "").strip().lower() == "consultant":
+        return "Consultant"
+    rt = (member.get("resource_type") or "").strip()
+    return rt if rt else "Internal"
+
+
+def search_resources(
+    database: Database,
+    required_skills: list[str],
+    bandwidth_needed: int = 0,
+    **_: Any,
+) -> dict[str, Any]:
+    """
+    Search team members matching required skills and availability.
+    Composite score = 70% skill match + 30% bandwidth availability.
+    Skills are matched strictly against the member's skills array.
+    """
+    raw_members = list(database["team_members"].find({"is_active": {"$ne": False}}))
+    members = [to_plain_document(doc) for doc in raw_members if doc]
+
+    project_lookup = _build_project_timeline_lookup(database)
+    eng_detail = _build_engagement_detail(database, project_lookup)
+
+    results: list[dict[str, Any]] = []
+    for member in members:
+        member_id = member.get("id", "")
+        projects = eng_detail.get(member_id, [])
+        committed = sum(p["engagement_level"] for p in projects)
+        avail_bw = round(max(0.0, 100.0 - committed), 1)
+
+        # Skip members who don't have enough bandwidth when a minimum is specified
+        if bandwidth_needed and avail_bw < bandwidth_needed:
+            continue
+
+        # Match strictly against the skills array — no role-token fallback
+        member_skills = _normalize_skills(member.get("skills") or member.get("Skills"))
+        skill_result = _score_skills(required_skills, member_skills)
+
+        # Composite: 70% skill match + 30% bandwidth availability
+        composite = round(skill_result["score"] * 0.7 + avail_bw * 0.3)
+
+        results.append({
+            "id": member_id,
+            "name": member.get("name", ""),
+            "role": member.get("role", ""),
+            "member_type": member.get("member_type", ""),
+            "resource_type": _resolve_resource_type(member),
+            "initials": member.get("initials", ""),
+            "color_hex": member.get("color_hex", "#6366f1"),
+            "skills": member_skills,
+            "available_bandwidth": avail_bw,
+            "committed_bandwidth": round(committed, 1),
+            "skill_score": skill_result["score"],
+            "matched_skills": skill_result["matched"],
+            "partial_skills": skill_result["partial"],
+            "composite_score": composite,
+            "active_projects": projects,
+        })
+
+    results.sort(key=lambda x: (-x["composite_score"], -x["available_bandwidth"]))
+
+    return {"members": results, "total": len(results)}
+
+
+def auto_allocate_resources(
+    database: Database,
+    resources_input: list[dict[str, Any]],
+    project_start: str | None = None,
+    project_end: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Auto-allocate best team members to resource slots.
+    Each member assigned at most once; minimum score 50, minimum availability 20%.
+    """
+    raw_members = list(database["team_members"].find({"is_active": {"$ne": False}}))
+    members = [to_plain_document(doc) for doc in raw_members if doc]
+
+    eng_map = _build_engagement_map(database)
+    used_bw: dict[str, float] = {}
+    assigned_ids: set[str] = set()
+
+    results: list[dict[str, Any]] = []
+    for res in resources_input:
+        required_skills = res.get("skills", [])
+        bandwidth_needed = int(res.get("bandwidth", 100))
+        assignments: list[dict[str, Any]] = []
+        open_bw = float(bandwidth_needed)
+
+        candidates: list[tuple[dict, dict, float]] = []
+        for member in members:
+            member_id = member.get("id", "")
+            if member_id in assigned_ids:
+                continue
+            committed = eng_map.get(member_id, 0.0) + used_bw.get(member_id, 0.0)
+            avail = max(0.0, 100.0 - committed)
+            if avail < 20.0:
+                continue
+            effective = _effective_skills(member)
+            skill_result = _score_skills(required_skills, effective)
+            # Accept candidates with any skill match, or if no required skills specified
+            if required_skills and skill_result["score"] < 10:
+                continue
+            candidates.append((member, skill_result, avail))
+
+        candidates.sort(key=lambda x: (-x[1]["score"], -x[2]))
+
+        if candidates:
+            best_member, best_skill, best_avail = candidates[0]
+            alloc_bw = min(open_bw, best_avail)
+            member_id = best_member.get("id", "")
+            assignments.append({
+                "type": "internal",
+                "id": member_id,
+                "name": best_member.get("name", ""),
+                "role": best_member.get("role", ""),
+                "bw": round(alloc_bw, 1),
+                "score": best_skill["score"],
+            })
+            used_bw[member_id] = used_bw.get(member_id, 0.0) + alloc_bw
+            assigned_ids.add(member_id)
+            open_bw -= alloc_bw
+
+        tbd_bw = max(0.0, open_bw)
+        results.append({
+            "resourceId": res.get("id", ""),
+            "role": res.get("role", ""),
+            "requiredBW": bandwidth_needed,
+            "assignments": assignments,
+            "tbdBW": round(tbd_bw, 1),
+            "status": "matched" if tbd_bw <= 0 else "partial",
+        })
+
+    return results
 
 
 def list_records(database: Database, table: str, query_params: dict[str, str]) -> list[dict[str, Any]]:
@@ -925,56 +1421,34 @@ def update_week_status(
     return to_plain_document(updated_milestone)
 
 
-def remove_week_status(
+def delete_week_status(
     database: Database,
     milestone_id: str,
     milestone_type: str,
     week_number: int,
 ) -> dict[str, Any] | None:
-    """
-    Remove status for a specific week in a milestone (clear the entry).
-
-    Args:
-        database: MongoDB database connection
-        milestone_id: ID of the milestone to update
-        milestone_type: Type of update - "practice", "signoff", or "invoice"
-        week_number: The week number to remove
-
-    Returns:
-        Updated milestone document with the week removed
-    """
-    # Validate milestone type
+    """Remove a specific week entry from a milestone's weeks array."""
     if milestone_type not in {"practice", "signoff", "invoice"}:
         raise HTTPException(status_code=400, detail="Invalid milestone type")
 
-    # Get the milestone
     milestone = database["milestones"].find_one({"id": milestone_id})
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
 
-    # Get the appropriate weeks array key
-    if milestone_type == "practice":
-        weeks_key = "practice_weeks"
-    elif milestone_type == "signoff":
-        weeks_key = "signoff_weeks"
-    else:  # invoice
-        weeks_key = "invoice_weeks"
-
-    # Get the weeks array
+    weeks_key = f"{milestone_type}_weeks"
     weeks_array = milestone.get(weeks_key, [])
+    filtered = [w for w in weeks_array if w.get("week_number") != week_number]
 
-    # Remove the week entry
-    weeks_array = [w for w in weeks_array if w.get("week_number") != week_number]
+    if len(filtered) == len(weeks_array):
+        raise HTTPException(status_code=404, detail=f"Week {week_number} not found")
 
-    # Save updated weeks array
     database["milestones"].update_one(
         {"id": milestone_id},
-        {"$set": {weeks_key: weeks_array, "updated_at": utc_now_iso()}}
+        {"$set": {weeks_key: filtered, "updated_at": utc_now_iso()}}
     )
 
-    # Return updated milestone
-    updated_milestone = database["milestones"].find_one({"id": milestone_id})
-    return to_plain_document(updated_milestone)
+    updated = database["milestones"].find_one({"id": milestone_id})
+    return to_plain_document(updated)
 
 
 def patch_record(database: Database, table: str, record_id: str, changes: Any) -> dict[str, Any] | None:
@@ -1081,3 +1555,104 @@ def save_upload(
         )
 
     return to_plain_document(document) or {}
+
+
+CLOUD_UPLOAD_FOLDER = "centralized_delivery_tracker_records"
+
+
+async def upload_to_cloud(
+    database: Database,
+    file: UploadFile,
+    settings: Any,
+    project_id: str,
+    update_id: str | None = None,
+    category: str | None = None,
+) -> dict[str, Any]:
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+
+    account_name = settings.azure_storage_account_name
+    account_key = settings.azure_storage_account_key
+    container_name = settings.azure_storage_container_name
+
+    if not account_name or not account_key or not container_name:
+        raise HTTPException(
+            status_code=500,
+            detail="Azure Storage is not configured. Set AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY, and AZURE_STORAGE_CONTAINER_NAME.",
+        )
+
+    safe_name = Path(file.filename or "upload.bin").name
+    timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
+    blob_name = f"{CLOUD_UPLOAD_FOLDER}/{timestamp}-{safe_name}"
+
+    connection_string = (
+        f"DefaultEndpointsProtocol=https;"
+        f"AccountName={account_name};"
+        f"AccountKey={account_key};"
+        f"EndpointSuffix=core.windows.net"
+    )
+
+    content = await file.read()
+
+    try:
+        blob_client = BlobServiceClient.from_connection_string(connection_string).get_blob_client(
+            container=container_name,
+            blob=blob_name,
+        )
+        blob_client.upload_blob(
+            content,
+            overwrite=True,
+            content_settings=ContentSettings(content_type=file.content_type or "application/octet-stream"),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Azure Blob upload failed: {exc}") from exc
+
+    blob_url = f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}"
+
+    file_details: dict[str, Any] = {
+        "name": safe_name,
+        "size": len(content),
+        "type": file.content_type or "application/octet-stream",
+        "path": blob_url,
+        "blob_name": blob_name,
+        "project_id": project_id,
+        "storage": "azure_blob",
+    }
+    if category:
+        file_details["category"] = category
+
+    document = normalize_on_insert("project_documents", file_details)
+    database["project_documents"].insert_one(document)
+
+    if update_id:
+        database["project_updates"].update_one(
+            {"id": update_id},
+            {"$set": {"file_path": blob_url, "file_name": safe_name}},
+        )
+
+    return to_plain_document(document) or {}
+
+
+async def get_skills_for_designation(designation: str, azure: Any) -> dict[str, Any]:
+    from .ai.azure_openai_service import AzureChatConfig
+    from .ai.prompts import DESIGNATION_SKILLS_SYSTEM, DESIGNATION_SKILLS_USER
+
+    designation = designation.strip()
+    if not designation:
+        raise HTTPException(status_code=400, detail="Designation is required")
+
+    prompt = DESIGNATION_SKILLS_USER.format(designation=designation)
+    config = AzureChatConfig(temperature=0.2, max_tokens=2048)
+
+    result = await azure.generate_json(
+        prompt=prompt,
+        system_prompt=DESIGNATION_SKILLS_SYSTEM,
+        config=config,
+    )
+
+    if not result or not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="LLM returned an unexpected response")
+
+    return result
