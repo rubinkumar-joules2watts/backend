@@ -438,22 +438,35 @@ def regenerate_project_milestone_weeks(database: Database, project_id: str) -> N
 
 def _count_weeks_in_month(year: int, month: int) -> int:
     """
-    Count rows a Sunday-first calendar widget shows for the given month.
-    When the 1st falls on Sunday, the preceding week is included as a header row
-    (matching the frontend calendar behavior visible in November 2026).
+    Count the number of Sun-Sat week rows displayed in a standard calendar view.
+    Each week starts on Sunday and contains 7 consecutive days.
+    
+    For example:
+    - February 2026 (starts on Sun): 4 week rows (1-7, 8-14, 15-21, 22-28)
+    - March 2026 (starts on Sun): 5 week rows (1-7, 8-14, 15-21, 22-28, 29-31+)
     """
-    first = datetime(year, month, 1)
-    # days_since_sunday: Sun=0, Mon=1, ..., Sat=6
-    days_since_sunday = (first.weekday() + 1) % 7
-    # If 1st is Sunday, step back a full week (include prior-month header row)
-    cal_start = first - timedelta(days=7 if days_since_sunday == 0 else days_since_sunday)
-    last = (
-        datetime(year + 1, 1, 1) - timedelta(days=1)
-        if month == 12
-        else datetime(year, month + 1, 1) - timedelta(days=1)
-    )
-    cal_end = last + timedelta(days=(5 - last.weekday()) % 7)
-    return (cal_end - cal_start).days // 7 + 1
+    first_day = datetime(year, month, 1)
+    
+    # Find the Sunday on or before the 1st of the month
+    # In Python: weekday() returns Mon=0, Tue=1, ..., Sun=6
+    # To find preceding Sunday, we calculate how many days back
+    days_to_sunday = (first_day.weekday() + 1) % 7
+    week_start = first_day - timedelta(days=days_to_sunday)
+    
+    # Get the last day of the month
+    if month == 12:
+        last_day = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_day = datetime(year, month + 1, 1) - timedelta(days=1)
+    
+    # Count how many complete weeks (Sun-Sat) fit between week_start and last_day
+    weeks_count = 0
+    current_week_start = week_start
+    while current_week_start <= last_day:
+        weeks_count += 1
+        current_week_start += timedelta(days=7)
+    
+    return weeks_count
 
 
 def generate_calendar_months(start_date: datetime) -> list[dict[str, Any]]:
