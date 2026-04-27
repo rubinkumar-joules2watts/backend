@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -21,6 +21,7 @@ COLLECTIONS = (
     "project_updates",
     "project_documents",
     "team_members_engagement",
+    "project_summaries",
 )
 
 
@@ -32,6 +33,8 @@ class Settings:
     cors_origins: tuple[str, ...]
     gemini_api_key: str
     gemini_model: str
+    groq_api_key: str
+    groq_model: str
     gpt4omini_api_key: str
     gpt4omini_endpoint: str
     gpt4omini_api_version: str
@@ -42,14 +45,25 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    load_dotenv(BASE_DIR / ".env")
+    env_path = BASE_DIR / ".env"
+    # Load environment variables from .env without overriding non-empty OS env vars.
+    # If a variable exists but is set to an empty string in the OS env, we still want
+    # to fall back to the value from .env (common in local shells).
+    load_dotenv(env_path)
+    dotenv_map = {k: (v or "").strip() for k, v in dotenv_values(env_path).items() if k}
 
-    mongo_uri = (
-        os.getenv("MONGODB_URI")
-        or os.getenv("MONGO_URI")
-        or os.getenv("MongoDB_URI")
-        or ""
-    ).strip()
+    def env_value(*names: str) -> str:
+        for name in names:
+            val = (os.getenv(name) or "").strip()
+            if val:
+                return val
+        for name in names:
+            val = (dotenv_map.get(name) or "").strip()
+            if val:
+                return val
+        return ""
+
+    mongo_uri = env_value("MONGODB_URI", "MONGO_URI", "MongoDB_URI")
     # For Vercel deployment, provide a fallback if MONGODB_URI is not set
     if not mongo_uri:
         # This will be overridden by environment variables in production
@@ -64,14 +78,15 @@ def load_settings() -> Settings:
     )
     origins = tuple(origin.strip() for origin in origins_raw.split(",") if origin.strip()) or ("*",)
 
-    gemini_api_key = (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-        or os.getenv("GEMINI_API_TOKEN")
-        or ""
-    ).strip()
+    gemini_api_key = env_value("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_TOKEN")
 
     gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
+    # Some setups may refer to Groq as "Grok" in env naming; accept both.
+    groq_api_key = env_value("GROQ_API_KEY", "GROK_API_KEY")
+    groq_model = (
+        env_value("GROQ_MODEL", "GROK_MODEL") or "llama-3.1-8b-instant"
+    ).strip() or "llama-3.1-8b-instant"
 
     gpt4omini_api_key = (os.getenv("GPT4OMINI_API_KEY") or "").strip()
     gpt4omini_endpoint = (os.getenv("GPT4OMINI_ENDPOINT") or "").strip()
@@ -89,6 +104,8 @@ def load_settings() -> Settings:
         cors_origins=origins,
         gemini_api_key=gemini_api_key,
         gemini_model=gemini_model,
+        groq_api_key=groq_api_key,
+        groq_model=groq_model,
         gpt4omini_api_key=gpt4omini_api_key,
         gpt4omini_endpoint=gpt4omini_endpoint,
         gpt4omini_api_version=gpt4omini_api_version,

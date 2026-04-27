@@ -6,6 +6,7 @@ from fastapi import Request
 
 from .azure_openai_service import AzureOpenAIService
 from .gemini_service import GeminiService
+from .groq_service import GroqService
 
 
 @lru_cache(maxsize=1)
@@ -28,6 +29,17 @@ def get_gemini_service(request: Request) -> GeminiService:
 
     settings = request.app.state.settings
     return _service_singleton(settings.gemini_api_key, settings.gemini_model)
+
+
+@lru_cache(maxsize=1)
+def _groq_singleton(api_key: str, model: str) -> GroqService:
+    return GroqService(api_key=api_key, model=model)
+
+
+def get_groq_service(request: Request) -> GroqService:
+    """FastAPI dependency helper for Groq."""
+    settings = request.app.state.settings
+    return _groq_singleton(settings.groq_api_key, settings.groq_model)
 
 
 @lru_cache(maxsize=1)
@@ -55,3 +67,17 @@ def get_gpt4omini_service(request: Request) -> AzureOpenAIService:
         settings.gpt4omini_api_version,
         settings.gpt4omini_deployment_name,
     )
+
+
+def get_ai_service() -> GeminiService:
+    """Helper to get the AI service outside of a FastAPI request context.
+
+    Priority:
+    1) Groq (when `GROQ_API_KEY` is set)
+    2) Gemini
+    """
+    from ..config import load_settings
+    settings = load_settings()
+    if settings.groq_api_key:
+        return _groq_singleton(settings.groq_api_key, settings.groq_model)
+    return _service_singleton(settings.gemini_api_key, settings.gemini_model)

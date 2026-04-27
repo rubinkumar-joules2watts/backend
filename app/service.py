@@ -17,6 +17,7 @@ from fastapi import HTTPException, UploadFile
 from pymongo.database import Database
 
 from .config import COLLECTIONS, UPLOADS_DIR
+from .ai import insight_service
 
 
 def utc_now_iso() -> str:
@@ -821,6 +822,129 @@ def _score_role_match(required_role: str, member_role: str) -> int:
 _llm_role_cache: dict[str, list[int]] = {}
 
 _log = logging.getLogger(__name__)
+
+# Debug helpers (opt-in via env var) -------------------------------------------------
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_truthy_default(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _truncate_str(value: str) -> str:
+    limit = max(20, _env_int("J2W_LOG_DB_STR_LIMIT", 500))
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}… (truncated, len={len(value)})"
+
+
+def _sanitize_for_log(value: Any) -> Any:
+    """
+    Best-effort sanitizer to avoid leaking obvious secrets in logs.
+    """
+    secretish_keys = {"password", "passwd", "secret", "token", "api_key", "apikey", "key"}
+
+    try:
+        from bson import ObjectId  # type: ignore
+    except Exception:  # pragma: no cover
+        ObjectId = None  # type: ignore
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _truncate_str(value)
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if ObjectId is not None and isinstance(value, ObjectId):  # type: ignore[arg-type]
+        return str(value)
+    if isinstance(value, list):
+        return [_sanitize_for_log(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_log(v) for v in list(value)]
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for k, v in value.items():
+            key = str(k)
+            lower_key = key.strip().lower()
+            if lower_key in secretish_keys or any(s in lower_key for s in secretish_keys):
+                sanitized[key] = "***"
+            else:
+                sanitized[key] = _sanitize_for_log(v)
+        if "_id" in sanitized:
+            sanitized["_id"] = str(sanitized["_id"])
+        return sanitized
+    return str(value)
+
+
+def _log_db_read(
+    collection: str,
+    *,
+    query: dict[str, Any] | None = None,
+    docs: Any,
+    context: str | None = None,
+) -> None:
+    """
+    Logs the DB collection name + data read for debugging.
+
+    Enable with:
+      - J2W_LOG_DB=1
+    Optional:
+      - J2W_LOG_DB_LIMIT=200
+      - J2W_LOG_DB_PRETTY=1 (default: on when J2W_LOG_DB=1)
+      - J2W_LOG_DB_STR_LIMIT=500
+    """
+    if not _env_truthy("J2W_LOG_DB"):
+        return
+
+    api_logger = logging.getLogger("delivery_tracker.api")
+    limit = max(1, _env_int("J2W_LOG_DB_LIMIT", 200))
+    pretty = _env_truthy_default("J2W_LOG_DB_PRETTY", True)
+
+    if isinstance(docs, list):
+        trimmed = docs[:limit]
+        payload: dict[str, Any] = {
+            "collection": collection,
+            "query": query or {},
+            "count": len(docs),
+            "logged": len(trimmed),
+            "truncated": len(docs) > len(trimmed),
+            "docs": [_sanitize_for_log(d) for d in trimmed],
+        }
+    else:
+        payload = {
+            "collection": collection,
+            "query": query or {},
+            "doc": _sanitize_for_log(docs),
+        }
+
+    prefix = f"[DB READ] {context} " if context else "[DB READ] "
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+        indent=2 if pretty else None,
+    )
+    if pretty:
+        api_logger.info("%s\n%s", prefix.rstrip(), rendered)
+    else:
+        api_logger.info("%s%s", prefix, rendered)
 
 # Keyword sets for job-family classification used as a safety floor after LLM scoring.
 # When LLM gives 0 to a role that clearly belongs to the same job family as the required
@@ -1692,3 +1816,657 @@ async def get_skills_for_designation(designation: str, azure: Any) -> dict[str, 
         raise HTTPException(status_code=502, detail="LLM returned an unexpected response")
 
     return result
+
+
+def _normalize_reporting_window(
+    start_date_str: str | None,
+    end_date_str: str | None,
+) -> tuple[datetime, datetime]:
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if now.month == 12:
+        next_month = now.replace(year=now.year + 1, month=1, day=1)
+    else:
+        next_month = now.replace(month=now.month + 1, day=1)
+    month_end = next_month.replace(hour=23, minute=59, second=59, microsecond=999999) - timedelta(days=1)
+
+    parsed_start = parse_date(start_date_str) if start_date_str else month_start
+    parsed_end = parse_date(end_date_str) if end_date_str else month_end
+
+    if not parsed_start:
+        parsed_start = month_start
+    if not parsed_end:
+        parsed_end = month_end
+
+    parsed_start = parsed_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    parsed_end = parsed_end.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    if parsed_start > parsed_end:
+        raise HTTPException(status_code=400, detail="start_date must be less than or equal to end_date")
+
+    return parsed_start, parsed_end
+
+
+def _window_intersection(
+    a_start: datetime,
+    a_end: datetime,
+    b_start: datetime,
+    b_end: datetime,
+) -> tuple[datetime, datetime] | None:
+    start = max(a_start, b_start)
+    end = min(a_end, b_end)
+    if start > end:
+        return None
+    return start, end
+
+
+def _extract_update_datetime(update: dict[str, Any]) -> datetime | None:
+    return parse_date(update.get("activity_date")) or parse_date(update.get("created_at"))
+
+
+def _extract_update_text(update: dict[str, Any]) -> str | None:
+    value = update.get("content") or update.get("comment")
+    if not value:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _safe_filename_part(value: str | None) -> str:
+    raw = (value or "report").strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw).strip("-._")
+    return cleaned[:80] or "report"
+
+
+def _collect_project_updates(
+    database: Database,
+    project_id: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> list[dict[str, Any]]:
+    start_date = window_start.date().isoformat()
+    end_date = window_end.date().isoformat()
+    start_ts = window_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_ts = window_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # DB-side windowing so we don't fetch all project updates when the caller only
+    # needs a bounded date range. Most records use `activity_date` (YYYY-MM-DD).
+    # For older/edge records that don't have activity_date, fall back to created_at.
+    query: dict[str, Any] = {
+        "project_id": project_id,
+        "$or": [
+            {"activity_date": {"$gte": start_date, "$lte": end_date}},
+            {
+                "activity_date": {"$exists": False},
+                "created_at": {"$gte": start_ts, "$lte": end_ts},
+            },
+            {
+                "activity_date": None,
+                "created_at": {"$gte": start_ts, "$lte": end_ts},
+            },
+            {
+                "activity_date": "",
+                "created_at": {"$gte": start_ts, "$lte": end_ts},
+            },
+        ],
+    }
+    updates = list(database["project_updates"].find(query))
+    _log_db_read(
+        "project_updates",
+        query=query,
+        docs=updates,
+        context=f"project_id={project_id} (db-windowed raw)",
+    )
+    filtered: list[dict[str, Any]] = []
+    for update in updates:
+        dt = _extract_update_datetime(update)
+        if not dt or dt < window_start or dt > window_end:
+            continue
+        text = _extract_update_text(update)
+        if not text:
+            continue
+        filtered.append(
+            {
+                "dt": dt,
+                "text": text,
+                "activity_date": update.get("activity_date"),
+                "created_at": update.get("created_at"),
+            }
+        )
+    filtered.sort(key=lambda item: item["dt"])
+    _log_db_read(
+        "project_updates",
+        query={
+            "project_id": project_id,
+            "window_start": window_start.date().isoformat(),
+            "window_end": window_end.date().isoformat(),
+        },
+        docs=filtered,
+        context=f"project_id={project_id} (filtered)",
+    )
+    return filtered
+
+
+async def generate_multi_project_report(
+    database: Database,
+    project_ids: list[str],
+    start_date_str: str | None = None,
+    end_date_str: str | None = None
+) -> list[dict[str, Any]]:
+    """
+    Generate an AI-backed status report for multiple projects within a strict date window.
+    Progress is bounded by:
+    1) Global reporting window.
+    2) Individual milestone start/end window.
+    """
+    report_start, report_end = _normalize_reporting_window(start_date_str, end_date_str)
+    report_start_label = report_start.date().isoformat()
+    report_end_label = report_end.date().isoformat()
+    report_results = []
+
+    if _env_truthy("J2W_LOG_DB"):
+        logging.getLogger("delivery_tracker.api").info(
+            "[REPORT] /reports/generate %s",
+            json.dumps(
+                {
+                    "project_ids": list(dict.fromkeys(project_ids)),
+                    "window_start": report_start_label,
+                    "window_end": report_end_label,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+    for pid in dict.fromkeys(project_ids):
+        project_query = {"id": pid}
+        project = database["projects"].find_one(project_query)
+        _log_db_read("projects", query=project_query, docs=project, context=f"project_id={pid}")
+        if not project:
+            continue
+
+        project_updates = _collect_project_updates(database, pid, report_start, report_end)
+        milestones_query = {"project_id": pid}
+        milestones = list(database["milestones"].find(milestones_query))
+        milestones.sort(key=lambda m: (str(m.get("milestone_code") or ""), str(m.get("description") or "")))
+
+        # Keep milestones aligned to the reporting window (inclusive) so both the
+        # report output and debug logs reflect only in-window workstreams.
+        in_window_milestones: list[dict[str, Any]] = []
+        for m in milestones:
+            milestone_start = (
+                parse_date(m.get("actual_start"))
+                or parse_date(m.get("planned_start"))
+                or report_start
+            )
+            milestone_end = (
+                parse_date(m.get("actual_end_eta"))
+                or parse_date(m.get("planned_end"))
+                or parse_date(m.get("planned_end_eta"))
+                or report_end
+            )
+            if milestone_end < milestone_start:
+                milestone_end = milestone_start
+            if not _window_intersection(report_start, report_end, milestone_start, milestone_end):
+                continue
+            in_window_milestones.append(m)
+
+        milestones = in_window_milestones
+        _log_db_read(
+            "milestones",
+            query={
+                **milestones_query,
+                "window_start": report_start_label,
+                "window_end": report_end_label,
+            },
+            docs=milestones,
+            context=f"project_id={pid} (in-window)",
+        )
+        milestone_insights = []
+
+        for m in milestones:
+            m_id = m.get("id")
+            m_name = m.get("milestone_code") or m.get("description", "Unknown")
+
+            milestone_start = (
+                parse_date(m.get("actual_start"))
+                or parse_date(m.get("planned_start"))
+                or report_start
+            )
+            milestone_end = (
+                parse_date(m.get("actual_end_eta"))
+                or parse_date(m.get("planned_end"))
+                or parse_date(m.get("planned_end_eta"))
+                or report_end
+            )
+            if milestone_end < milestone_start:
+                milestone_end = milestone_start
+
+            bounded_window = _window_intersection(report_start, report_end, milestone_start, milestone_end)
+            if not bounded_window:
+                continue
+            bounded_start, bounded_end = bounded_window
+
+            bounded_updates = [
+                u for u in project_updates
+                if bounded_start <= u["dt"] <= bounded_end
+            ]
+            logs = [f"{u['dt'].date().isoformat()}: {u['text']}" for u in bounded_updates]
+
+            insight = await insight_service.generate_milestone_insight(
+                m_name,
+                m.get("description", ""),
+                m.get("status", "Unknown"),
+                logs,
+                start_date=bounded_start.date().isoformat(),
+                end_date=bounded_end.date().isoformat(),
+                milestone_meta={
+                    "milestone_code": m.get("milestone_code"),
+                    "planned_start": m.get("planned_start"),
+                    "planned_end": m.get("planned_end"),
+                    "planned_end_eta": m.get("planned_end_eta"),
+                    "actual_start": m.get("actual_start"),
+                    "actual_end_eta": m.get("actual_end_eta"),
+                    "actual_end": m.get("actual_end"),
+                    "completion_pct": m.get("completion_pct"),
+                    "invoice_status": m.get("invoice_status"),
+                    "client_signoff_status": m.get("client_signoff_status"),
+                    "blocker": m.get("blocker"),
+                },
+            )
+
+            milestone_insights.append({
+                "id": m_id,
+                "name": m_name,
+                "description": m.get("description"),
+                "status": m.get("status"),
+                "planned_start": m.get("planned_start"),
+                "planned_end": m.get("planned_end") or m.get("planned_end_eta"),
+                "actual_start": m.get("actual_start"),
+                "actual_end": m.get("actual_end_eta"),
+                "window_start": bounded_start.date().isoformat(),
+                "window_end": bounded_end.date().isoformat(),
+                "log_count": len(logs),
+                "timeline_summary": insight,
+            })
+
+        proj_summary = await insight_service.generate_project_executive_summary(
+            project.get("name", "Unnamed Project"),
+            [{"name": m["name"], "summary": m["timeline_summary"]} for m in milestone_insights],
+            project_updates=[f"{u['dt'].date().isoformat()}: {u['text']}" for u in project_updates],
+            start_date=report_start_label,
+            end_date=report_end_label,
+        )
+
+        report_results.append({
+            "project_id": pid,
+            "project_name": project.get("name"),
+            "manager": project.get("delivery_manager"),
+            "spoc": project.get("client_spoc"),
+            "status": project.get("status"),
+            "window_start": report_start_label,
+            "window_end": report_end_label,
+            "project_update_count_in_window": len(project_updates),
+            "executive_summary": proj_summary,
+            "milestones": milestone_insights,
+        })
+
+    return report_results
+
+
+async def generate_project_insight_report(
+    database: Database,
+    project_ids: list[str],
+    start_date_str: str | None = None,
+    end_date_str: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Backward-compatible wrapper.
+    """
+    return await generate_multi_project_report(database, project_ids, start_date_str, end_date_str)
+
+
+def _report_lines(report: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    lines.append(f"Project Status Report: {report.get('project_name') or 'Unnamed Project'}")
+    lines.append(f"Reporting Window: {report.get('window_start', '')} to {report.get('window_end', '')}")
+    lines.append("")
+    lines.append("Executive Summary")
+    lines.append(str(report.get("executive_summary") or ""))
+    lines.append("")
+    lines.append("Milestone Timeline Stories")
+    for idx, milestone in enumerate(report.get("milestones") or [], start=1):
+        lines.append(
+            f"{idx}. {milestone.get('name', 'Milestone')} | "
+            f"Status: {milestone.get('status') or 'Unknown'} | "
+            f"Window: {milestone.get('window_start', '')} to {milestone.get('window_end', '')}"
+        )
+        lines.append(str(milestone.get("timeline_summary") or "No in-window activity."))
+        lines.append("")
+    return lines
+
+
+def _resolve_j2w_logo_path() -> Path | None:
+    service_file = Path(__file__).resolve()
+    repo_root = service_file.parents[2]
+    candidates = [
+        service_file.parent / "assets" / "j2w-logo.png",
+        repo_root / "j2w-flow-insight" / "src" / "assets" / "j2w-logo.png",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _write_docx_report(path: Path, reports: list[dict[str, Any]]) -> None:
+    from docx import Document
+    from docx.shared import Inches
+
+    doc = Document()
+    logo_path = _resolve_j2w_logo_path()
+
+    def add_header() -> None:
+        if logo_path:
+            doc.add_picture(str(logo_path), width=Inches(0.9))
+        doc.add_paragraph("J2W Delivery Tracker")
+
+    for idx, report in enumerate(reports):
+        if idx > 0:
+            doc.add_page_break()
+        add_header()
+        doc.add_heading(f"Project Status Report: {report.get('project_name') or 'Unnamed Project'}", level=1)
+        doc.add_paragraph(
+            f"Reporting Window: {report.get('window_start', '')} to {report.get('window_end', '')}"
+        )
+        doc.add_heading("Executive Summary", level=2)
+        doc.add_paragraph(str(report.get("executive_summary") or ""))
+
+        doc.add_heading("Milestone Timeline Stories", level=2)
+        for milestone in report.get("milestones") or []:
+            title = (
+                f"{milestone.get('name', 'Milestone')}  "
+                f"[Status: {milestone.get('status') or 'Unknown'}]"
+            )
+            doc.add_paragraph(title, style="List Bullet")
+            doc.add_paragraph(str(milestone.get("timeline_summary") or "No in-window activity."))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
+
+
+def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    x = 40
+    y = 88
+    line_height = 15
+    bottom = 800
+    logo_path = _resolve_j2w_logo_path()
+    logo_bytes = logo_path.read_bytes() if logo_path else None
+
+    def _safe_text(target_page: fitz.Page, pos: tuple, text: str, size: int, font: str, color: tuple):
+        try:
+            target_page.insert_text(pos, text, fontsize=size, fontname=font, color=color)
+        except Exception:
+            try:
+                target_page.insert_text(pos, text, fontsize=size, fontname="helv", color=color)
+            except Exception:
+                pass
+
+    def draw_page_header(target_page: fitz.Page, proj_name: str) -> None:
+        target_page.draw_rect(fitz.Rect(0, 0, 595, 60), color=(0.97, 0.98, 1.0), fill=(0.97, 0.98, 1.0), overlay=False)
+        header_y = 35
+        if logo_bytes:
+            try:
+                target_page.insert_image(fitz.Rect(x, 15, x + 35, 45), stream=logo_bytes, keep_proportion=True)
+                _safe_text(target_page, (x + 42, header_y), "J2W Delivery Tracker", 14, "hebo", (0.1, 0.2, 0.45))
+            except Exception:
+                _safe_text(target_page, (x, header_y), "J2W Delivery Tracker", 14, "hebo", (0.1, 0.2, 0.45))
+        else:
+            _safe_text(target_page, (x, header_y), "J2W Delivery Tracker", 14, "hebo", (0.1, 0.2, 0.45))
+        
+        _safe_text(target_page, (400, header_y), f"Generated: {datetime.now().strftime('%b %d, %Y')}", 8, "helv", (0.5, 0.5, 0.5))
+        target_page.draw_line(fitz.Point(x, 55), fitz.Point(555, 55), color=(0.85, 0.88, 0.92), width=1.0)
+
+    def write_line(text: str, font_size: int = 10, font_name: str = "helv", color: tuple = (0.2, 0.2, 0.2), indent: int = 0) -> None:
+        nonlocal page, y
+        if y > bottom:
+            page = doc.new_page(width=595, height=842)
+            draw_page_header(page, "Continued")
+            y = 100
+        _safe_text(page, (x + indent, y), text, font_size, font_name, color)
+        y += line_height
+
+    def write_wrapped(
+        text: str,
+        width: int = 88,
+        font_size: float = 10.0,
+        color: tuple = (0.2, 0.2, 0.2),
+        indent: int = 0,
+        prefix: str = "",
+        hanging_indent: int = 12,
+    ) -> None:
+        content = (text or "").strip()
+        if not content:
+            return
+
+        words = content.split()
+        current = ""
+        first_line = True
+
+        for w in words:
+            candidate = f"{current}{w} "
+            if len(candidate) <= width:
+                current = candidate
+            else:
+                if first_line and prefix:
+                    write_line(f"{prefix}{current.rstrip()}", font_size=font_size, color=color, indent=indent)
+                else:
+                    cont_indent = indent + (hanging_indent if prefix else 0)
+                    write_line(current.rstrip(), font_size=font_size, color=color, indent=cont_indent)
+                first_line = False
+                current = w + " "
+
+        if current.strip():
+            if first_line and prefix:
+                write_line(f"{prefix}{current.rstrip()}", font_size=font_size, color=color, indent=indent)
+            else:
+                cont_indent = indent + (hanging_indent if prefix else 0)
+                write_line(current.rstrip(), font_size=font_size, color=color, indent=cont_indent)
+
+    def normalize_timeline_points(story: str) -> list[str]:
+        points: list[str] = []
+        for raw in (story or "").splitlines():
+            line = (raw or "").strip()
+            if not line:
+                continue
+            if line.startswith("- "):
+                line = line[2:].strip()
+
+            lower = line.lower()
+            if lower.startswith("schedule:"):
+                rest = line.split(":", 1)[1].strip()
+                points.append("Schedule")
+                for seg in re.split(r",\s+", rest.replace(";", ",")):
+                    seg = seg.strip()
+                    if seg:
+                        points.append(f"  {seg}")
+                continue
+
+            points.append(line)
+        return points
+
+    for ridx, report in enumerate(reports):
+        if ridx > 0:
+            page = doc.new_page(width=595, height=842)
+            y = 100
+        else:
+            y = 100
+        
+        draw_page_header(page, report.get("project_name", ""))
+        
+        # Project Title Section
+        y = 110 # Down from 100 to avoid header overlap
+        _safe_text(page, (x, y), "PROJECT STATUS REPORT", 9, "hebo", (0.4, 0.4, 0.4))
+        y += 24 # Increased from 15
+        _safe_text(page, (x, y), str(report.get("project_name", "Unnamed Project")).upper(), 22, "hebo", (0.0, 0.2, 0.6))
+        y += 18
+        _safe_text(page, (x, y), f"Reporting Horizon: {report.get('window_start')} to {report.get('window_end')}", 10, "helv", (0.5, 0.5, 0.5))
+        
+        y += 45 # Breathing room after header
+
+        # Executive Summary
+        _safe_text(page, (x, y), "EXECUTIVE NARRATIVE", 12, "hebo", (0.1, 0.5, 0.3))
+        y += 18
+        summary = str(report.get("executive_summary") or "No narrative generated.")
+        for chunk in summary.splitlines():
+            clean_chunk = (chunk or "").strip()
+            if not clean_chunk:
+                continue
+
+            if clean_chunk.startswith("##"):
+                section_title = clean_chunk.lstrip("#").strip()
+                write_line(section_title, font_size=11, font_name="hebo", color=(0.12, 0.25, 0.55))
+                y += 4
+                continue
+
+            if clean_chunk.startswith("- "):
+                write_wrapped(
+                    clean_chunk[2:].strip(),
+                    width=86,
+                    font_size=10.5,
+                    color=(0.15, 0.15, 0.15),
+                    indent=0,
+                    prefix="- ",
+                    hanging_indent=10,
+                )
+            else:
+                write_wrapped(clean_chunk, width=90, font_size=10.5, color=(0.15, 0.15, 0.15), indent=0)
+
+            y += 4
+
+        y += 30 # Gap after executive summary
+
+        # Milestones
+        _safe_text(page, (x, y), "MILESTONE PROGRESS STORIES", 12, "hebo", (0.3, 0.3, 0.3))
+        y += 20
+        
+        for m in report.get("milestones", []):
+            m_name = str(m.get("name") or "M")
+            m_status = str(m.get("status") or "Unknown")
+            
+            status_color = (0.2, 0.6, 0.2) if "complete" in m_status.lower() else (0.8, 0.5, 0.0)
+            if "risk" in m_status.lower() or "block" in m_status.lower():
+                status_color = (0.8, 0.1, 0.1)
+
+            _safe_text(page, (x, y), f"{m_name}: {m.get('description') or ''}", 10.5, "hebo", (0.1, 0.1, 0.1))
+            y += 12
+            _safe_text(page, (x + 15, y), f"STATUS: {m_status.upper()}", 8, "hebo", status_color)
+            y += 15
+            
+            story = str(m.get("timeline_summary") or "No in-window activity updates recorded.")
+            for item in normalize_timeline_points(story):
+                if not item:
+                    continue
+
+                if item == "Schedule":
+                    write_line("- Schedule", font_size=10, font_name="hebo", color=(0.30, 0.30, 0.30), indent=15)
+                    y += 2
+                    continue
+
+                if item.startswith("  "):
+                    write_wrapped(
+                        item.strip(),
+                        width=78,
+                        font_size=9.5,
+                        color=(0.35, 0.35, 0.35),
+                        indent=30,
+                        prefix="- ",
+                        hanging_indent=10,
+                    )
+                else:
+                    write_wrapped(
+                        item,
+                        width=84,
+                        font_size=10,
+                        color=(0.35, 0.35, 0.35),
+                        indent=15,
+                        prefix="- ",
+                        hanging_indent=10,
+                    )
+                y += 3
+            
+            y += 20 # Gap between milestones
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
+    doc.close()
+
+
+def export_status_report(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    reports = payload.get("reports")
+    if not isinstance(reports, list) or not reports:
+        raise HTTPException(status_code=400, detail="reports must be a non-empty list")
+
+    batch_mode = str(payload.get("batch_mode") or "single").strip().lower()
+    if batch_mode not in {"single", "per_project"}:
+        raise HTTPException(status_code=400, detail="batch_mode must be 'single' or 'per_project'")
+
+    export_format = str(payload.get("format") or "docx").strip().lower()
+    if export_format not in {"docx", "pdf"}:
+        raise HTTPException(status_code=400, detail="format must be 'docx' or 'pdf'")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_dir = UPLOADS_DIR / "reports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    generated_files: list[dict[str, Any]] = []
+
+    def _render_file(target_path: Path, report_list: list[dict[str, Any]]) -> None:
+        if export_format == "docx":
+            _write_docx_report(target_path, report_list)
+        else:
+            _write_pdf_report(target_path, report_list)
+
+    if batch_mode == "single":
+        base = _safe_filename_part(payload.get("file_name") or f"status_report_{timestamp}")
+        file_name = f"{base}.{export_format}"
+        path = output_dir / file_name
+        _render_file(path, reports)
+        generated_files.append(
+            {
+                "project_id": None,
+                "project_name": "Unified",
+                "file_name": file_name,
+                "path": f"uploads/reports/{file_name}",
+                "download_url": f"/api/files/uploads/reports/{file_name}?download=true",
+            }
+        )
+    else:
+        for report in reports:
+            project_name = _safe_filename_part(str(report.get("project_name") or "project"))
+            project_id = _safe_filename_part(str(report.get("project_id") or "unknown"))
+            file_name = f"{project_name}_{project_id}_{timestamp}.{export_format}"
+            path = output_dir / file_name
+            _render_file(path, [report])
+            generated_files.append(
+                {
+                    "project_id": report.get("project_id"),
+                    "project_name": report.get("project_name"),
+                    "file_name": file_name,
+                    "path": f"uploads/reports/{file_name}",
+                    "download_url": f"/api/files/uploads/reports/{file_name}?download=true",
+                }
+            )
+
+    return {
+        "batch_mode": batch_mode,
+        "format": export_format,
+        "generated_at": utc_now_iso(),
+        "files": generated_files,
+    }

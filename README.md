@@ -14,6 +14,7 @@ uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `MONGODB_URI` is read from `backend/.env`
 - `MONGODB_DB_NAME` defaults to `delivery_tracker`
 - `API_PORT` defaults to `8000`
+- Debug DB logging (for `/api/reports/generate` reads): set `J2W_LOG_DB=1` (optional: `J2W_LOG_DB_LIMIT=200`, `J2W_LOG_DB_PRETTY=1`, `J2W_LOG_DB_STR_LIMIT=500`)
 
 ### Gemini (Flash 2.5)
 
@@ -21,6 +22,13 @@ Set these in `backend/.env` (see `backend/.env.example`) or your deployment envi
 
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
 - `GEMINI_MODEL` (default: `gemini-2.5-flash`)
+
+### Groq (Llama 3.1)
+
+If `GROQ_API_KEY` is set, the insight report generation uses Groq (instead of Gemini).
+
+- `GROQ_API_KEY`
+- `GROQ_MODEL` (default: `llama-3.1-8b-instant`)
 
 Minimal usage (inside an async FastAPI endpoint):
 
