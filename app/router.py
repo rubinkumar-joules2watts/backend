@@ -19,6 +19,7 @@ from .service import (
     auto_allocate_resources,
     create_records,
     delete_record,
+    export_status_report,
     get_dashboard_counters,
     get_milestone_health,
     get_record,
@@ -33,6 +34,7 @@ from .service import (
     update_milestone_health,
     update_week_status,
     upload_to_cloud,
+    generate_project_insight_report,
 )
 
 
@@ -283,7 +285,25 @@ def download_file(file_path: str, download: str | None = None) -> FileResponse:
     if not resolved.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(path=str(resolved), filename=download or Path(file_path).name)
+    media_type = None
+    if resolved.suffix.lower() == ".pdf":
+        media_type = "application/pdf"
+    elif resolved.suffix.lower() == ".docx":
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    # Treat query param as boolean flag (e.g., download=true) instead of filename.
+    as_attachment = str(download or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if as_attachment:
+        return FileResponse(
+            path=str(resolved),
+            filename=Path(file_path).name,
+            media_type=media_type,
+        )
+
+    return FileResponse(
+        path=str(resolved),
+        media_type=media_type,
+    )
 
 
 @router.patch("/projects/{project_id}")
@@ -427,6 +447,48 @@ async def get_designation_skills(
     if not designation:
         raise HTTPException(status_code=400, detail="designation is required in request body")
     return await get_skills_for_designation(designation, azure)
+
+
+@router.post("/reports/generate")
+async def generate_report_endpoint(payload: Any = Body(...)) -> list[dict[str, Any]]:
+    """
+    Generate an AI-driven insight report for selected projects and date range.
+    
+    Body:
+        {
+            "project_ids": ["pid1", "pid2"],
+            "start_date": "2026-04-01",
+            "end_date": "2026-04-30"
+        }
+    """
+    project_ids = payload.get("project_ids", [])
+    if not project_ids:
+        raise HTTPException(status_code=400, detail="project_ids list is required")
+        
+    return await generate_project_insight_report(
+        get_database(),
+        project_ids=project_ids,
+        start_date_str=payload.get("start_date"),
+        end_date_str=payload.get("end_date")
+    )
+
+
+@router.post("/export-status-report")
+def export_status_report_endpoint(payload: Any = Body(...)) -> dict[str, Any]:
+    """
+    Export edited insight reports into DOCX or PDF.
+
+    Body:
+        {
+            "reports": [...],              # required
+            "batch_mode": "single",        # "single" | "per_project"
+            "format": "docx",              # "docx" | "pdf"
+            "file_name": "optional-name"   # used for single mode
+        }
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return export_status_report(payload)
 
 
 @router.get("/{table}")
