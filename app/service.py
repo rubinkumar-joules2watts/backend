@@ -513,9 +513,10 @@ def get_milestone_health(database: Database, project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="No milestones found for this project")
 
     # Collect planned_start dates to build calendar month range
+    # Falls back to actual_start if planned_start is not available
     planned_starts: list[datetime] = []
     for m in milestones:
-        ps = parse_date(m.get("planned_start") or m.get("plannedStart"))
+        ps = parse_date(m.get("planned_start") or m.get("plannedStart") or m.get("actual_start"))
         if ps:
             planned_starts.append(ps)
 
