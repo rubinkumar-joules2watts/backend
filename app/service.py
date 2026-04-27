@@ -1892,6 +1892,16 @@ def _safe_filename_part(value: str | None) -> str:
     return cleaned[:80] or "report"
 
 
+def _to_ddmmyyyy(value: str | None) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
+    if not m:
+        return text
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+
+
 def _collect_project_updates(
     database: Database,
     project_id: str,
@@ -1974,8 +1984,10 @@ async def generate_multi_project_report(
     2) Individual milestone start/end window.
     """
     report_start, report_end = _normalize_reporting_window(start_date_str, end_date_str)
-    report_start_label = report_start.date().isoformat()
-    report_end_label = report_end.date().isoformat()
+    report_start_iso = report_start.date().isoformat()
+    report_end_iso = report_end.date().isoformat()
+    report_start_label = _to_ddmmyyyy(report_start_iso)
+    report_end_label = _to_ddmmyyyy(report_end_iso)
     report_results = []
 
     if _env_truthy("J2W_LOG_DB"):
@@ -1984,8 +1996,8 @@ async def generate_multi_project_report(
             json.dumps(
                 {
                     "project_ids": list(dict.fromkeys(project_ids)),
-                    "window_start": report_start_label,
-                    "window_end": report_end_label,
+                    "window_start": report_start_iso,
+                    "window_end": report_end_iso,
                 },
                 ensure_ascii=False,
                 default=str,
@@ -2028,14 +2040,14 @@ async def generate_multi_project_report(
         milestones = in_window_milestones
         _log_db_read(
             "milestones",
-            query={
-                **milestones_query,
-                "window_start": report_start_label,
-                "window_end": report_end_label,
-            },
-            docs=milestones,
-            context=f"project_id={pid} (in-window)",
-        )
+                query={
+                    **milestones_query,
+                    "window_start": report_start_iso,
+                    "window_end": report_end_iso,
+                },
+                docs=milestones,
+                context=f"project_id={pid} (in-window)",
+            )
         milestone_insights = []
 
         for m in milestones:
@@ -2066,14 +2078,16 @@ async def generate_multi_project_report(
                 if bounded_start <= u["dt"] <= bounded_end
             ]
             logs = [f"{u['dt'].date().isoformat()}: {u['text']}" for u in bounded_updates]
+            bounded_start_label = _to_ddmmyyyy(bounded_start.date().isoformat())
+            bounded_end_label = _to_ddmmyyyy(bounded_end.date().isoformat())
 
             insight = await insight_service.generate_milestone_insight(
                 m_name,
                 m.get("description", ""),
                 m.get("status", "Unknown"),
                 logs,
-                start_date=bounded_start.date().isoformat(),
-                end_date=bounded_end.date().isoformat(),
+                start_date=bounded_start_label,
+                end_date=bounded_end_label,
                 milestone_meta={
                     "milestone_code": m.get("milestone_code"),
                     "planned_start": m.get("planned_start"),
@@ -2098,8 +2112,8 @@ async def generate_multi_project_report(
                 "planned_end": m.get("planned_end") or m.get("planned_end_eta"),
                 "actual_start": m.get("actual_start"),
                 "actual_end": m.get("actual_end_eta"),
-                "window_start": bounded_start.date().isoformat(),
-                "window_end": bounded_end.date().isoformat(),
+                "window_start": bounded_start_label,
+                "window_end": bounded_end_label,
                 "log_count": len(logs),
                 "timeline_summary": insight,
             })
@@ -2107,7 +2121,7 @@ async def generate_multi_project_report(
         proj_summary = await insight_service.generate_project_executive_summary(
             project.get("name", "Unnamed Project"),
             [{"name": m["name"], "summary": m["timeline_summary"]} for m in milestone_insights],
-            project_updates=[f"{u['dt'].date().isoformat()}: {u['text']}" for u in project_updates],
+            project_updates=[f"{_to_ddmmyyyy(u['dt'].date().isoformat())}: {u['text']}" for u in project_updates],
             start_date=report_start_label,
             end_date=report_end_label,
         )
@@ -2352,16 +2366,32 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
                 line = line[2:].strip()
 
             lower = line.lower()
-            if lower.startswith("schedule:"):
-                rest = line.split(":", 1)[1].strip()
-                points.append("Schedule")
-                for seg in re.split(r",\s+", rest.replace(";", ",")):
-                    seg = seg.strip()
-                    if seg:
-                        points.append(f"  {seg}")
+            # Drop milestone meta labels if the model accidentally emits them.
+            if lower.startswith("milestone:") or lower.startswith("milestone name:") or lower.startswith("milestones:"):
+                continue
+            if lower.startswith("commercials:") or "invoice/completion status" in lower:
                 continue
 
-            points.append(line)
+            # For PDF readability, remove the leading label (e.g., "Progress:") but keep the substance.
+            label_prefixes = (
+                "schedule:",
+                "progress:",
+                "weekly status trend:",
+                "update cadence:",
+                "risks/blockers:",
+                "risks:",
+                "blockers:",
+                "next steps:",
+                "next step:",
+            )
+            for prefix in label_prefixes:
+                if lower.startswith(prefix):
+                    remainder = line.split(":", 1)[1].strip()
+                    if remainder:
+                        points.append(remainder)
+                    break
+            else:
+                points.append(line)
         return points
 
     for ridx, report in enumerate(reports):
@@ -2380,7 +2410,18 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
         y += 24
         _safe_text(page, (x, y), str(report.get("project_name", "Unnamed Project")).upper(), 22, "hebo", (0.0, 0.2, 0.6))
         y += 18
-        _safe_text(page, (x, y), f"Reporting Horizon: {report.get('window_start')} to {report.get('window_end')}", 10, "helv", (0.5, 0.5, 0.5))
+        _safe_text(page, (x, y), "REPORTING WINDOW", 7.5, "hebo", (0.55, 0.55, 0.55))
+        y += 12
+        _safe_text(page, (x, y), f"{report.get('window_start')} to {report.get('window_end')}", 10, "helv", (0.35, 0.35, 0.35))
+
+        health_value = str(report.get("status") or "").strip() or "Not specified"
+        _safe_text(page, (x + 180, y - 12), "HEALTH STATE", 7.5, "hebo", (0.55, 0.55, 0.55))
+        health_color = (0.10, 0.60, 0.30)
+        if any(token in health_value.lower() for token in ("risk", "blocked", "at risk")):
+            health_color = (0.80, 0.10, 0.10)
+        elif any(token in health_value.lower() for token in ("pending", "hold")):
+            health_color = (0.80, 0.50, 0.00)
+        _safe_text(page, (x + 180, y), health_value.upper(), 10, "hebo", health_color)
 
         y += 44
 
@@ -2426,34 +2467,15 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
         y += 20
 
         for m in report.get("milestones", []):
-            m_name = str(m.get("name") or "M")
-            m_status = str(m.get("status") or "Unknown")
-
-            status_color = (0.2, 0.6, 0.2) if "complete" in m_status.lower() else (0.8, 0.5, 0.0)
-            if "risk" in m_status.lower() or "block" in m_status.lower():
-                status_color = (0.8, 0.1, 0.1)
-
-            ensure_space(48)
-            write_wrapped(
-                f"{m_name}: {m.get('description') or ''}",
-                width=86,
-                font_size=10.5,
-                color=(0.1, 0.1, 0.1),
-                indent=0,
-            )
-            y += 2
-            _safe_text(page, (x + 15, y), f"STATUS: {m_status.upper()}", 8, "hebo", status_color)
-            y += 15
+            ensure_space(24)
+            # Intentionally hide milestone meta headings like "M9: SEO Apr" and "STATUS: ON TRACK" in PDF output.
+            # The milestone story bullets below carry the relevant narrative detail.
+            page.draw_line(fitz.Point(x, y), fitz.Point(right_margin, y), color=(0.90, 0.90, 0.92), width=0.8)
+            y += 12
 
             story = str(m.get("timeline_summary") or "No in-window activity updates recorded.")
             for item in normalize_timeline_points(story):
                 if not item:
-                    continue
-
-                if item == "Schedule":
-                    ensure_space(24)
-                    write_line("- Schedule", font_size=10, font_name="hebo", color=(0.30, 0.30, 0.30), indent=15)
-                    y += 2
                     continue
 
                 if item.startswith("  "):
