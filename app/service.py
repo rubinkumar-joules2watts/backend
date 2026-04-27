@@ -2198,12 +2198,18 @@ def _write_docx_report(path: Path, reports: list[dict[str, Any]]) -> None:
 def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
     import fitz
 
-    doc = fitz.open()
-    page = doc.new_page(width=595, height=842)
-    x = 40
-    y = 88
+    page_width = 595
+    page_height = 842
+    left_margin = 40
+    right_margin = 555
+    body_top = 100
+    body_bottom = 790
     line_height = 15
-    bottom = 800
+
+    doc = fitz.open()
+    page = doc.new_page(width=page_width, height=page_height)
+    x = left_margin
+    y = body_top
     logo_path = _resolve_j2w_logo_path()
     logo_bytes = logo_path.read_bytes() if logo_path else None
 
@@ -2216,8 +2222,36 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
             except Exception:
                 pass
 
+    def _safe_textbox(
+        target_page: fitz.Page,
+        rect: fitz.Rect,
+        text: str,
+        size: int,
+        font: str,
+        color: tuple,
+        align: int = 0,
+    ) -> None:
+        try:
+            target_page.insert_textbox(rect, text, fontsize=size, fontname=font, color=color, align=align)
+        except Exception:
+            try:
+                target_page.insert_textbox(rect, text, fontsize=size, fontname="helv", color=color, align=align)
+            except Exception:
+                pass
+
+    def draw_page_watermark(target_page: fitz.Page) -> None:
+        if not logo_bytes:
+            return
+        try:
+            rect = fitz.Rect(130, 220, 465, 600)
+            # Preserve original PNG transparency and reduce intensity with a white veil.
+            target_page.insert_image(rect, stream=logo_bytes, keep_proportion=True, overlay=False)
+            target_page.draw_rect(rect, color=None, fill=(1, 1, 1), fill_opacity=0.82, overlay=True)
+        except Exception:
+            pass
+
     def draw_page_header(target_page: fitz.Page, proj_name: str) -> None:
-        target_page.draw_rect(fitz.Rect(0, 0, 595, 60), color=(0.97, 0.98, 1.0), fill=(0.97, 0.98, 1.0), overlay=False)
+        target_page.draw_rect(fitz.Rect(0, 0, page_width, 60), color=(0.97, 0.98, 1.0), fill=(0.97, 0.98, 1.0), overlay=False)
         header_y = 35
         if logo_bytes:
             try:
@@ -2227,16 +2261,33 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
                 _safe_text(target_page, (x, header_y), "J2W Delivery Tracker", 14, "hebo", (0.1, 0.2, 0.45))
         else:
             _safe_text(target_page, (x, header_y), "J2W Delivery Tracker", 14, "hebo", (0.1, 0.2, 0.45))
-        
-        _safe_text(target_page, (400, header_y), f"Generated: {datetime.now().strftime('%b %d, %Y')}", 8, "helv", (0.5, 0.5, 0.5))
-        target_page.draw_line(fitz.Point(x, 55), fitz.Point(555, 55), color=(0.85, 0.88, 0.92), width=1.0)
+
+        _safe_textbox(
+            target_page,
+            fitz.Rect(360, 24, right_margin, 42),
+            f"Generated: {datetime.now().strftime('%b %d, %Y')}",
+            8,
+            "helv",
+            (0.5, 0.5, 0.5),
+            align=2,
+        )
+        target_page.draw_line(fitz.Point(x, 55), fitz.Point(right_margin, 55), color=(0.85, 0.88, 0.92), width=1.0)
+        draw_page_watermark(target_page)
+
+    def ensure_space(required_height: int) -> None:
+        nonlocal page, y
+        if y + required_height <= body_bottom:
+            return
+        page = doc.new_page(width=page_width, height=page_height)
+        draw_page_header(page, "Continued")
+        y = body_top
 
     def write_line(text: str, font_size: int = 10, font_name: str = "helv", color: tuple = (0.2, 0.2, 0.2), indent: int = 0) -> None:
         nonlocal page, y
-        if y > bottom:
-            page = doc.new_page(width=595, height=842)
+        if y > body_bottom:
+            page = doc.new_page(width=page_width, height=page_height)
             draw_page_header(page, "Continued")
-            y = 100
+            y = body_top
         _safe_text(page, (x + indent, y), text, font_size, font_name, color)
         y += line_height
 
@@ -2301,24 +2352,26 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
 
     for ridx, report in enumerate(reports):
         if ridx > 0:
-            page = doc.new_page(width=595, height=842)
-            y = 100
+            page = doc.new_page(width=page_width, height=page_height)
+            y = body_top
         else:
-            y = 100
-        
+            y = body_top
+
         draw_page_header(page, report.get("project_name", ""))
-        
+
         # Project Title Section
-        y = 110 # Down from 100 to avoid header overlap
+        y = 110
+        ensure_space(110)
         _safe_text(page, (x, y), "PROJECT STATUS REPORT", 9, "hebo", (0.4, 0.4, 0.4))
-        y += 24 # Increased from 15
+        y += 24
         _safe_text(page, (x, y), str(report.get("project_name", "Unnamed Project")).upper(), 22, "hebo", (0.0, 0.2, 0.6))
         y += 18
         _safe_text(page, (x, y), f"Reporting Horizon: {report.get('window_start')} to {report.get('window_end')}", 10, "helv", (0.5, 0.5, 0.5))
-        
-        y += 45 # Breathing room after header
+
+        y += 44
 
         # Executive Summary
+        ensure_space(80)
         _safe_text(page, (x, y), "EXECUTIVE NARRATIVE", 12, "hebo", (0.1, 0.5, 0.3))
         y += 18
         summary = str(report.get("executive_summary") or "No narrative generated.")
@@ -2329,11 +2382,13 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
 
             if clean_chunk.startswith("##"):
                 section_title = clean_chunk.lstrip("#").strip()
+                ensure_space(24)
                 write_line(section_title, font_size=11, font_name="hebo", color=(0.12, 0.25, 0.55))
                 y += 4
                 continue
 
             if clean_chunk.startswith("- "):
+                ensure_space(24)
                 write_wrapped(
                     clean_chunk[2:].strip(),
                     width=86,
@@ -2344,40 +2399,51 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
                     hanging_indent=10,
                 )
             else:
+                ensure_space(24)
                 write_wrapped(clean_chunk, width=90, font_size=10.5, color=(0.15, 0.15, 0.15), indent=0)
 
             y += 4
 
-        y += 30 # Gap after executive summary
+        y += 28
 
         # Milestones
+        ensure_space(70)
         _safe_text(page, (x, y), "MILESTONE PROGRESS STORIES", 12, "hebo", (0.3, 0.3, 0.3))
         y += 20
-        
+
         for m in report.get("milestones", []):
             m_name = str(m.get("name") or "M")
             m_status = str(m.get("status") or "Unknown")
-            
+
             status_color = (0.2, 0.6, 0.2) if "complete" in m_status.lower() else (0.8, 0.5, 0.0)
             if "risk" in m_status.lower() or "block" in m_status.lower():
                 status_color = (0.8, 0.1, 0.1)
 
-            _safe_text(page, (x, y), f"{m_name}: {m.get('description') or ''}", 10.5, "hebo", (0.1, 0.1, 0.1))
-            y += 12
+            ensure_space(48)
+            write_wrapped(
+                f"{m_name}: {m.get('description') or ''}",
+                width=86,
+                font_size=10.5,
+                color=(0.1, 0.1, 0.1),
+                indent=0,
+            )
+            y += 2
             _safe_text(page, (x + 15, y), f"STATUS: {m_status.upper()}", 8, "hebo", status_color)
             y += 15
-            
+
             story = str(m.get("timeline_summary") or "No in-window activity updates recorded.")
             for item in normalize_timeline_points(story):
                 if not item:
                     continue
 
                 if item == "Schedule":
+                    ensure_space(24)
                     write_line("- Schedule", font_size=10, font_name="hebo", color=(0.30, 0.30, 0.30), indent=15)
                     y += 2
                     continue
 
                 if item.startswith("  "):
+                    ensure_space(24)
                     write_wrapped(
                         item.strip(),
                         width=78,
@@ -2388,6 +2454,7 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
                         hanging_indent=10,
                     )
                 else:
+                    ensure_space(24)
                     write_wrapped(
                         item,
                         width=84,
@@ -2398,8 +2465,15 @@ def _write_pdf_report(path: Path, reports: list[dict[str, Any]]) -> None:
                         hanging_indent=10,
                     )
                 y += 3
-            
-            y += 20 # Gap between milestones
+
+            y += 18
+
+    total_pages = len(doc)
+    for pidx in range(total_pages):
+        footer_page = doc[pidx]
+        footer_page.draw_line(fitz.Point(left_margin, 806), fitz.Point(right_margin, 806), color=(0.9, 0.9, 0.92), width=0.8)
+        _safe_text(footer_page, (left_margin, 822), "Confidential - Internal Delivery Management", 7, "helv", (0.55, 0.55, 0.55))
+        _safe_text(footer_page, (right_margin - 32, 822), f"{pidx + 1}/{total_pages}", 7, "helv", (0.55, 0.55, 0.55))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(path))
