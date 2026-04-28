@@ -25,6 +25,7 @@ from .service import (
     get_record,
     get_skills_for_designation,
     get_team_members_with_engagement,
+    upsert_team_member_engagement,
     list_records,
     patch_record,
     replace_record,
@@ -366,6 +367,17 @@ def get_team_member_engagements(member_id: str) -> list[dict[str, Any]]:
         List of engagement records for that team member
     """
     return list_records(get_database(), "team_members_engagement", {"team_member_id": member_id})
+
+
+@router.post("/team_members_engagement")
+def upsert_team_members_engagement_endpoint(payload: Any = Body(...)) -> dict[str, Any]:
+    """
+    Upsert a team member engagement by (team_member_id, project_id).
+
+    If a record already exists for the given pair, it is updated.
+    Otherwise, a new record is created.
+    """
+    return upsert_team_member_engagement(get_database(), payload)
 
 
 @router.post("/resources/search")

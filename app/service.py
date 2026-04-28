@@ -58,6 +58,10 @@ def normalize_on_insert(table: str, document: dict[str, Any]) -> dict[str, Any]:
         next_document["created_at"] = next_document.get("created_at") or now
         next_document["changed_by"] = next_document.get("changed_by") or "system"
 
+    if table == "team_members_engagement":
+        next_document["created_at"] = next_document.get("created_at") or now
+        next_document["updated_at"] = next_document.get("updated_at") or now
+
     # Initialize week data arrays for milestones (will be populated after insert)
     if table == "milestones":
         next_document["practice_weeks"] = next_document.get("practice_weeks") or []
@@ -65,6 +69,43 @@ def normalize_on_insert(table: str, document: dict[str, Any]) -> dict[str, Any]:
         next_document["invoice_weeks"] = next_document.get("invoice_weeks") or []
 
     return next_document
+
+
+def upsert_team_member_engagement(database: Database, payload: Any) -> dict[str, Any]:
+    """
+    Upsert into `team_members_engagement` by (team_member_id, project_id).
+    - If a record exists for the pair, update it.
+    - Otherwise create a new record.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    team_member_id = str(payload.get("team_member_id") or "").strip()
+    project_id = str(payload.get("project_id") or "").strip()
+    if not team_member_id or not project_id:
+        raise HTTPException(status_code=400, detail="team_member_id and project_id are required")
+
+    engagement_collection = database["team_members_engagement"]
+    existing = engagement_collection.find_one({"team_member_id": team_member_id, "project_id": project_id})
+
+    if existing:
+        existing_id = str(existing.get("id") or "")
+        next_changes = deepcopy(payload)
+        next_changes.pop("_id", None)
+        next_changes.pop("id", None)
+        next_changes["team_member_id"] = team_member_id
+        next_changes["project_id"] = project_id
+        next_changes["updated_at"] = utc_now_iso()
+
+        engagement_collection.update_one({"id": existing_id}, {"$set": next_changes})
+        updated = engagement_collection.find_one({"id": existing_id})
+        return to_plain_document(updated) or {}
+
+    document = normalize_on_insert("team_members_engagement", payload)
+    document["team_member_id"] = team_member_id
+    document["project_id"] = project_id
+    engagement_collection.insert_one(document)
+    return to_plain_document(document) or {}
 
 
 def build_filter(query_params: dict[str, str]) -> dict[str, str]:
@@ -470,6 +511,45 @@ def _count_weeks_in_month(year: int, month: int) -> int:
     return weeks_count
 
 
+_UUID_LIKE_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}$"
+)
+
+
+def _resolve_project_display_name(project_doc: dict[str, Any] | None, fallback_project_id: str | None = None) -> str:
+    """
+    Resolve the best human-readable project name from mixed project schemas.
+    Prefers explicit project-name fields over generic `name`.
+    """
+    if not project_doc:
+        return fallback_project_id or "Unnamed Project"
+
+    candidate_keys = (
+        "project_name",
+        "project_title",
+        "projectTitle",
+        "title",
+        "name",
+    )
+    for key in candidate_keys:
+        value = project_doc.get(key)
+        if not value:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        # Avoid showing UUIDs as display names.
+        if _UUID_LIKE_RE.match(text):
+            continue
+        return text
+
+    return fallback_project_id or "Unnamed Project"
+
+
 def generate_calendar_months(start_date: datetime) -> list[dict[str, Any]]:
     """
     Generate month entries from start_date's month through December 2026.
@@ -716,6 +796,15 @@ def get_team_members_with_engagement(database: Database) -> list[dict[str, Any]]
     
     # Get all team members
     team_members = [to_plain_document(doc) for doc in team_members_collection.find({})]
+
+    # Build project lookup once so each engagement can include project name
+    projects_collection = database["projects"]
+    project_name_by_id: dict[str, str] = {}
+    for project in projects_collection.find({}, {"id": 1, "name": 1, "project_name": 1, "project_title": 1, "projectTitle": 1, "title": 1}):
+        project_id = str(project.get("id") or "")
+        if not project_id:
+            continue
+        project_name_by_id[project_id] = _resolve_project_display_name(project, None)
     
     # Enhance each team member with engagement data
     result = []
@@ -726,37 +815,44 @@ def get_team_members_with_engagement(database: Database) -> list[dict[str, Any]]
         engagements = list(engagement_collection.find({"team_member_id": member_id}))
         
         if engagements:
-            # Calculate average engagement percentage from engagement_level or engagement_percentage
-            engagement_levels = []
+            enriched_engagements: list[dict[str, Any]] = []
             for eng in engagements:
-                # Try engagement_percentage first, then engagement_level
+                plain_eng = to_plain_document(eng) or {}
+                project_id = str(plain_eng.get("project_id") or "")
+                if project_id:
+                    plain_eng["project_name"] = project_name_by_id.get(project_id, "Unnamed Project")
+                else:
+                    plain_eng["project_name"] = "Unnamed Project"
+
+                # Skip unresolved projects from response payload.
+                if plain_eng.get("project_name") == "Unnamed Project":
+                    continue
+                enriched_engagements.append(plain_eng)
+
+            # engagement_pct should represent total engagement load per member.
+            total_engagement_pct = 0.0
+            for eng in enriched_engagements:
                 level = eng.get("engagement_percentage")
                 if level is None:
                     level = eng.get("engagement_level")
-                
-                if level is not None:
-                    # Convert to float if it's a string
-                    try:
-                        level = float(level)
-                        engagement_levels.append(level)
-                    except (ValueError, TypeError):
-                        pass
-            
-            avg_engagement_pct = sum(engagement_levels) / len(engagement_levels) if engagement_levels else 0
-            
-            # Calculate total hours and tasks
-            total_hours = sum(eng.get("engagement_hours", 0) for eng in engagements)
-            total_tasks_completed = sum(eng.get("task_completed", 0) for eng in engagements)
-            total_tasks_pending = sum(eng.get("task_pending", 0) for eng in engagements)
-            project_count = len(engagements)
-            
+                try:
+                    total_engagement_pct += float(level)
+                except (ValueError, TypeError):
+                    pass
+
+            # Calculate totals only for valid/visible engagements.
+            total_hours = sum(eng.get("engagement_hours", 0) for eng in enriched_engagements)
+            total_tasks_completed = sum(eng.get("task_completed", 0) for eng in enriched_engagements)
+            total_tasks_pending = sum(eng.get("task_pending", 0) for eng in enriched_engagements)
+            project_count = len(enriched_engagements)
+
             # Add engagement data to member
-            member["engagement_pct"] = round(avg_engagement_pct, 2)
+            member["engagement_pct"] = round(total_engagement_pct, 2)
             member["total_engagement_hours"] = total_hours
             member["total_tasks_completed"] = total_tasks_completed
             member["total_tasks_pending"] = total_tasks_pending
             member["projects_assigned"] = project_count
-            member["engagements"] = [to_plain_document(eng) for eng in engagements]
+            member["engagements"] = enriched_engagements
         else:
             # No engagements found
             member["engagement_pct"] = 0
@@ -767,8 +863,85 @@ def get_team_members_with_engagement(database: Database) -> list[dict[str, Any]]
             member["engagements"] = []
         
         result.append(member)
-    
-    return result
+
+    # Deduplicate by member name so repeated records are merged into one card/user.
+    deduped_by_name: dict[str, dict[str, Any]] = {}
+    deduped_order: list[str] = []
+    for member in result:
+        name_raw = str(member.get("name") or "").strip()
+        dedupe_key = " ".join(name_raw.lower().split()) if name_raw else f"id::{member.get('id')}"
+
+        if dedupe_key not in deduped_by_name:
+            base = deepcopy(member)
+            base["engagements"] = list(member.get("engagements") or [])
+            deduped_by_name[dedupe_key] = base
+            deduped_order.append(dedupe_key)
+            continue
+
+        existing = deduped_by_name[dedupe_key]
+
+        # Fill missing basic profile fields from duplicate rows.
+        for key, value in member.items():
+            if key == "engagements":
+                continue
+            if existing.get(key) in (None, "", []):
+                existing[key] = value
+
+        # Merge skills uniquely.
+        existing_skills = existing.get("skills")
+        incoming_skills = member.get("skills")
+        if isinstance(existing_skills, list) or isinstance(incoming_skills, list):
+            merged_skills = []
+            seen_skills: set[str] = set()
+            for skill in (existing_skills or []) + (incoming_skills or []):
+                text = str(skill).strip()
+                if not text:
+                    continue
+                key = text.lower()
+                if key in seen_skills:
+                    continue
+                seen_skills.add(key)
+                merged_skills.append(text)
+            existing["skills"] = merged_skills
+
+        # Merge engagements uniquely by engagement id.
+        existing_engagements = existing.get("engagements") or []
+        incoming_engagements = member.get("engagements") or []
+        merged_engagements: list[dict[str, Any]] = []
+        seen_eng_ids: set[str] = set()
+        for eng in list(existing_engagements) + list(incoming_engagements):
+            eng_id = str(eng.get("id") or "")
+            if eng_id and eng_id in seen_eng_ids:
+                continue
+            if eng_id:
+                seen_eng_ids.add(eng_id)
+            merged_engagements.append(eng)
+        existing["engagements"] = merged_engagements
+
+    deduped_result: list[dict[str, Any]] = []
+    for key in deduped_order:
+        member = deduped_by_name[key]
+        engagements = member.get("engagements") or []
+
+        total_engagement_pct = 0.0
+        for eng in engagements:
+            level = eng.get("engagement_percentage")
+            if level is None:
+                level = eng.get("engagement_level")
+            try:
+                total_engagement_pct += float(level)
+            except (ValueError, TypeError):
+                pass
+
+        member["engagement_pct"] = round(total_engagement_pct, 2)
+        member["total_engagement_hours"] = sum(eng.get("engagement_hours", 0) for eng in engagements)
+        member["total_tasks_completed"] = sum(eng.get("task_completed", 0) for eng in engagements)
+        member["total_tasks_pending"] = sum(eng.get("task_pending", 0) for eng in engagements)
+        member["projects_assigned"] = len(engagements)
+
+        deduped_result.append(member)
+
+    return deduped_result
 
 
 # ── Resource Search & Auto-Allocation ────────────────────────────────────────
@@ -1087,7 +1260,7 @@ def _build_project_timeline_lookup(database: Database) -> dict[str, dict[str, An
     for doc in database["projects"].find({}):
         pid = doc.get("id", "")
         if pid:
-            projects_by_id[pid] = {"name": doc.get("name", ""), "starts": [], "ends": []}
+            projects_by_id[pid] = {"name": _resolve_project_display_name(doc, str(pid)), "starts": [], "ends": []}
 
     for m in database["milestones"].find({}):
         pid = m.get("project_id", "")
